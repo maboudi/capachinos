@@ -15,6 +15,7 @@ class EEGPreprocessor:
         self.participant_id = eeg_file.participant_id
         self.eeg_data = eeg_file.eeg_data
         self.channel_names = eeg_file.channel_names
+        self.channel_groups = eeg_file.channel_groups
         self.sampling_frequency = eeg_file.sampling_frequency
         self.ds_sampling_frequency = None
         self.down_sampled_eeg = None

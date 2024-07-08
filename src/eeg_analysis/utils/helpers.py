@@ -33,6 +33,6 @@ def create_mne_raw_from_data(data, channel_names, sampling_frequency, eeg_channe
     raw_data_transposed = data.T
 
     # Create the Raw object
-    raw = mne.io.RawArray(raw_data_transposed, info)
+    raw = mne.io.RawArray(raw_data_transposed, info, verbose=False)
 
     return raw

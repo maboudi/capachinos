@@ -23,6 +23,14 @@ class EEGFile:
         self.eeg_data = None
         self.sampling_interval = None
         self.sampling_frequency = None
+        self.channel_groups = {
+            'prefrontal': ['Fp1', 'Fp2', 'AFz'],
+            'frontal': ['F5', 'F6', 'Fz'],
+            'central': ['C3', 'C4', 'Cz'],
+            'temporal': ['T7', 'T8'],
+            'parietal': ['P5', 'P6', 'Pz'],
+            'occipital': ['O1', 'O2'],
+        }
 
     def read_vhdr(self):
         """

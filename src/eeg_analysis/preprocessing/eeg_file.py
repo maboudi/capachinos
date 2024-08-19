@@ -107,7 +107,7 @@ class EEGFile:
             self.create_event('pre_incision', end_marker='skin incision', duration= 300),
             self.create_event('maintenance', start_marker='loss of consciousness', end_marker='drug infusion'),
             self.create_event('pre_drug_infusion', end_marker='drug infusion', duration=600),
-            self.create_event('emergence', start_marker='drug infusion', end_marker='extubation'),
+            self.create_event('emergence', start_marker='drug infusion', end_marker='extubation'), 
             self.create_event('pacu_rest', start_marker='pacu rest start', end_marker='pacu rest end')
         ]
 
@@ -128,6 +128,7 @@ class EEGFile:
 
         Returns a dictionary representing the event with 'name', 'start', and 'end' times.
         """
+        total_duration = int(self.eeg_data.shape[0]/self.sampling_frequency) # in second
 
         start_time = None
         end_time = None
@@ -140,11 +141,11 @@ class EEGFile:
 
         # If no end marker is provided, use the start marker and duration to define the event
         if start_time is not None and end_time is None and duration is not None:
-            end_time = start_time + duration
+            end_time = min(total_duration, start_time + duration)
 
         # If no start marker is provided, use the end marker and duration to define the event
         if start_time is None and end_time is not None and duration is not None:
-            start_time = end_time - duration
+            start_time = max(0, end_time - duration)
 
         # Error checking to ensure we have valid start and end times
         if start_time is None or end_time is None:
@@ -170,6 +171,9 @@ class EEGFile:
                 if eeg_data_format == 'BINARY':
                     raw_data = np.fromfile(file, dtype=eeg_data_type)
                     self.eeg_data = raw_data.reshape(-1, num_channels)
+
+            print("EEG Data Shape:", self.eeg_data.shape)  # Add this line to verify data shape
+
         except Exception as e:
             print(f"Error reading .eeg file: {e}")
 

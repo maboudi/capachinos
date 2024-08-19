@@ -1027,23 +1027,6 @@ class PowerSpectralAnalysis:
         self.emergence_trajectory = {}  # Replace with actual spectral parameter calculation
 
 
-"""
-# Example usage:
-# Assuming preprocessed_data is an object with a participant_id attribute and preprocessed EEG data
-preprocessed_data = type('PreprocessedData', (object,), {'participant_id': 1, 'data': 'Preprocessed EEG data'})()  # Dummy preprocessed data object
-psa = PowerSpectralAnalysis(preprocessed_data)
-psa.whiten_signal()
-psa.calculate_power_spectral()
-psa.calculate_group_level_spectrogram()
-psa.display_power_spectra()
-psa.calculate_spectral_parameters()
-
-print(psa.whitened_signal)
-print(psa.power_spectral_density)
-print(psa.group_spectrogram)
-print(psa.spectral_parameters)
-"""
-
 
 import numpy as np
 from sklearn.decomposition import PCA
@@ -1120,43 +1103,3 @@ class MetastableSpectralDynamicAnalysis:
         """
         # Placeholder for cluster consistency determination logic
         pass  # Replace with actual consistency determination
-
-
-"""
-# Example usage:
-data_per_individual = {}  # Dictionary to store data for each individual
-num_participants = 10
-window_size = 20
-frequency_intervals = [(0, 4), (4, 8), (8, 12), (12, 30)]
-
-# Generate random data for each participant
-for i in range(num_participants):
-    data_per_individual[i+1] = np.random.rand(100, 32)  # Example data
-
-# Create MetastableSpectralDynamicAnalysis objects for each individual
-msda_per_individual = {}
-for participant_id, data in data_per_individual.items():
-    msda_per_individual[participant_id] = MetastableSpectralDynamicAnalysis(participant_id, data)
-
-# Perform analysis for each individual
-for msda in msda_per_individual.values():
-    msda.construct_spectral_power_vectors(window_size, frequency_intervals)
-    msda.remove_outlier_windows()
-
-# Concatenate data whenever needed
-concatenated_vectors = np.concatenate([msda.pca_vectors for msda in msda_per_individual.values()], axis=0)
-
-# Apply PCA and remaining analysis steps for individual or concatenated data
-# Example for individual data
-individual_msda = msda_per_individual[1]  # Assuming we want to analyze individual data for participant 1
-individual_msda.apply_pca(num_components=10)
-individual_msda.categorize_clusters(num_clusters=5)
-
-# Example for concatenated data
-pca = PCA(n_components=10)
-pca.fit(concatenated_vectors)
-pca_vectors_concatenated = pca.transform(concatenated_vectors)
-kmeans = KMeans(n_clusters=5)
-cluster_labels_concatenated = kmeans.fit_predict(pca_vectors_concatenated)
-cluster_quality_concatenated = silhouette_score(pca_vectors_concatenated, cluster_labels_concatenated)
-"""

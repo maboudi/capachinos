@@ -1,8 +1,9 @@
 import numpy as np
 from scipy.signal import butter, filtfilt, hilbert, find_peaks
 from scipy.stats import pearsonr
+import pandas as pd
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional
 from numpy.typing import NDArray
 import powerlaw
 from powerlaw import trim_to_range
@@ -130,26 +131,6 @@ class PhaseLagEntropy:
         
         entropy_topography = np.mean(entropy_matrix, axis=1)
         return entropy_topography
-    
-
-class AvalancheDetectionParams:
-    def __init__(self, 
-                 threshold: float = 2.0, 
-                 method: str ='beggs', 
-                 epoch_names: Optional[List[str]] = None,
-                 inter_event_interval: int = 8,
-                 bin_size: int = 2,
-                 use_pearson_correlation: bool = True, 
-                 correlation_threshold: float = 0.75, 
-                 event_boundary: str ='zero_crossing'):
-        self.threshold = threshold
-        self.method = method
-        self.epoch_names = epoch_names
-        self.inter_event_interval = inter_event_interval
-        self.bin_size = bin_size
-        self.use_pearson_correlation = use_pearson_correlation
-        self.correlation_threshold = correlation_threshold
-        self.event_boundary = event_boundary
 
 @dataclass
 class PowerLawFitResult:
@@ -178,6 +159,188 @@ class PowerLawFitResult:
     D_2d: NDArray[np.float64] = field(default_factory=lambda: np.full((0, 0), np.nan))
     sigma_2d: NDArray[np.float64] = field(default_factory=lambda: np.full((0, 0), np.nan))
     R_exp_2d: NDArray[np.float64] = field(default_factory=lambda: np.full((0, 0), np.nan))
+
+
+class PowerLawAnalyzer:
+    def __init__(self, data: np.ndarray):
+        self.data = data
+
+    def generate_log_space_values(self, start_value: float, stop_value:float, num: int):
+        if start_value == 0:
+            warn('The start value should not be zero due to logarithmic operations. The method returns NaNs.')
+        # return np.logspace(np.log10(start_value), np.log10(stop_value), num)
+        return np.linspace(start_value, stop_value, num)
+
+    def generate_and_sort_fit_ranges(self, values: NDArray) -> List[Tuple[float, float]]:
+        """ 
+        generate the ranges of parameter values
+        over which the power law fit exponent will be calculated. 
+        Its highly similar to the definition of the supports 
+        (pairs of values defining the fit range) are defined in NCC toolbox. 
+        """
+        pairs = list(itertools.product(values, repeat=2))  # Generate all combinations of values with themselves
+
+        # allocate differnet set of values to xmin and xmax
+        # mid_index = len(values) // 2
+        # first_half = values[:mid_index]
+        # second_half = values[mid_index:]
+        # pairs = list(itertools.product(first_half, second_half)) # Generate all combinations of first_half values with second_half values
+
+        # Constrain to fit within region data
+        constrained_pairs = [
+            pair for pair in pairs 
+            if pair[0] >= np.min(self.data) 
+            and pair[1] <= np.max(self.data) 
+            and pair[1] > pair[0]
+        ]
+        # if not constrained_pairs:
+        #     constrained_pairs = [[max(first_half), min(second_half)]]
+
+        try:
+            sorted_pairs = sorted(constrained_pairs, key=lambda pair: (np.log(pair[1]) - np.log(pair[0])) ** 2, reverse=True)
+        except:
+            sorted_pairs = constrained_pairs
+        
+        return sorted_pairs
+
+    def compute_power_law_fits(self, start_value: float = None, stop_value: float = None, num_values: int = 20) -> PowerLawFitResult:
+        
+        if start_value is None:
+            start_value = np.min(self.data)
+        if stop_value is None:
+            stop_value = np.max(self.data)
+        
+        if len(set(self.data)) < 50:
+            values = np.array(list(set(self.data)))
+        else:
+            values = self.generate_log_space_values(start_value, stop_value, num_values)
+        
+        fit_ranges = self.generate_and_sort_fit_ranges(values)
+
+        alphas, Ds, sigmas, Rs_exp, ps_exp, ps, xmins, xmaxs = [], [], [], [], [], [], [], []
+
+        unique_xmins = sorted(set(x for x, _ in fit_ranges))
+        unique_xmaxs = sorted(set(x for _, x in fit_ranges))
+
+        xmin_to_index = {xmin: i for i, xmin in enumerate(unique_xmins)}
+        xmax_to_index = {xmax: j for j, xmax in enumerate(unique_xmaxs)}
+
+        alpha_2d = np.full((len(unique_xmins), len(unique_xmaxs)), np.nan)
+        D_2d = np.full((len(unique_xmins), len(unique_xmaxs)), np.nan)
+        sigma_2d = np.full((len(unique_xmins), len(unique_xmaxs)), np.nan)
+        R_exp_2d = np.full((len(unique_xmins), len(unique_xmaxs)), np.nan)
+
+        for xmin, xmax in fit_ranges:
+            
+            # check if enough data is remained to fit power law, after trimming the data to the range (xmin, xmax)
+            data_trimmed = trim_to_range(self.data, xmin, xmax)
+            if (len(data_trimmed) < (len(self.data) / 2)) or (len(np.unique(data_trimmed)) < 3):
+                continue
+
+            fit = powerlaw.Fit(data_trimmed, xmin=xmin, xmax=xmax, discrete=True, verbose=False)
+
+            xmins.append(xmin)
+            xmaxs.append(xmax)
+
+            alphas.append(fit.power_law.alpha)
+            Ds.append(fit.power_law.D)
+            sigmas.append(fit.power_law.sigma)
+
+            R, p_exp = fit.distribution_compare('power_law', 'exponential')
+            Rs_exp.append(R)
+            ps_exp.append(p_exp)
+
+            i = xmin_to_index[xmin]
+            j = xmax_to_index[xmax]
+
+            alpha_2d[i, j] = fit.power_law.alpha
+            D_2d[i, j] = fit.power_law.D
+            sigma_2d[i, j] = fit.power_law.sigma
+            R_exp_2d[i, j] = R
+
+            # We might calcualte and append the p-value for the power-law fit
+            # p = self._calculate_powerlaw_fit_p_value(fit, data, xmin, xmax)
+            # ps.append(p)
+
+        D = min(Ds)
+        min_D_idx = Ds.index(D)
+        alpha = alphas[min_D_idx]
+        sigma = sigmas[min_D_idx]
+        R_exp = Rs_exp[min_D_idx]
+        p_exp = ps_exp[min_D_idx]
+        xmin = xmins[min_D_idx]
+        xmax = xmaxs[min_D_idx]
+        # p = ps[min_D_idx]
+
+        return PowerLawFitResult(
+            alpha=alpha,
+            D=D,
+            sigma=sigma,
+            R_exp=R_exp,
+            p_exp=p_exp,
+            p=None, # Calculate if needed
+            xmin=xmin,
+            xmax=xmax,
+            alphas=alphas,
+            Ds=Ds,
+            sigmas=sigmas,
+            Rs_exp=Rs_exp,
+            ps_exp=ps_exp,
+            ps=ps, # Populate if p-values are to be included
+            xmins=xmins,
+            xmaxs=xmaxs,
+            alpha_2d=alpha_2d,
+            D_2d=D_2d,
+            sigma_2d=sigma_2d,
+            R_exp_2d=R_exp_2d
+        )
+    
+    def _calculate_powerlaw_fit_p_value(self, fit, data, xmin, xmax, num_bootstraps=100):
+        """
+        Calculate the p-value of the power-law fit using bootstrapping.
+        
+        Parameters:
+        fit: powerlaw.Fit object
+        num_bootstraps: int, number of bootstrap samples to use (default 1000)
+        
+        Returns:
+        p: float, p-value of the fit
+        """
+        # Get the KS statistic for the power-law fit
+        ks_stat = fit.power_law.D
+        
+        # Generate bootstrap samples
+        bootstrap_ks_stats = []
+        for _ in range(num_bootstraps):
+            bootstrap_sample = np.random.choice(data, size=len(data), replace=True)
+            bootstrap_fit = powerlaw.Fit(bootstrap_sample, xmin=xmin, xmax=xmax, discrete=True, verbose=False)
+            bootstrap_ks_stat = bootstrap_fit.power_law.D
+            bootstrap_ks_stats.append(bootstrap_ks_stat)
+        
+        # Calculate the p-value
+        p_value = np.sum(np.array(bootstrap_ks_stats) > ks_stat) / num_bootstraps
+        return p_value
+    
+
+class AvalancheDetectionParams:
+    def __init__(self, 
+                 threshold: float = 2.0, 
+                 method: str ='beggs', 
+                 epoch_names: Optional[List[str]] = None,
+                 inter_event_interval: int = 8,
+                 bin_size: int = 2,
+                 use_pearson_correlation: bool = True, 
+                 correlation_threshold: float = 0.75, 
+                 event_boundary: str ='zero_crossing'):
+        self.threshold = threshold
+        self.method = method
+        self.epoch_names = epoch_names
+        self.inter_event_interval = inter_event_interval
+        self.bin_size = bin_size
+        self.use_pearson_correlation = use_pearson_correlation
+        self.correlation_threshold = correlation_threshold
+        self.event_boundary = event_boundary
+
 
 @dataclass
 class AvalancheParams:
@@ -435,7 +598,7 @@ class NeuronalAvalanche:
 
         # Calculate the z-scored EEG data
         # z_scored_eeg = EEGPreprocessor.calculate_z_score(eeg)
-        z_scored_eeg = calculate_z_score_eeg(eeg, duration=120, sampling_rate=self.sampling_frequency, peak_threshold=8)
+        z_scored_eeg = calculate_z_score_eeg(eeg, duration=60, sampling_rate=self.sampling_frequency, peak_threshold=8)
 
         if method == 'scarpetta':
             # Detect segments where the signal exceeds the threshold (absolute z-scored amplitude)
@@ -479,7 +642,7 @@ class NeuronalAvalanche:
             # Check for correlated events across other channels
             if use_pearson_correlation:
                 for event in list(detected_events):
-                    start, peak_index, end, chan_idx, peak_value = event
+                    start, peak_index, end, chan_idx, peak_value, _ = event
                     period = z_scored_eeg[start:end+1, chan_idx]
                     if end >= start+2: # minumum length to calculate correlation, esp. if event boundaries are set by threshold crossings 
                         period_slice = z_scored_eeg[start:end+1, :]
@@ -498,7 +661,7 @@ class NeuronalAvalanche:
                                     other_peak_idx = start + peak_rel_index
 
                                     if (peak_value * other_peak_value) > 0: # if the peak in the main detected event is positive include peaks in correlated channels that are also positive and vice versa
-                                        new_event = (start, other_peak_idx, end, other_chan_idx, other_peak_value, np.nan)
+                                        new_event = (start, other_peak_idx, end, other_chan_idx, other_peak_value, -1)
                                         if (other_peak_idx, other_chan_idx) not in seen_events:
                                             detected_events.append(enforce_types(new_event))
                                             seen_events.add((int(other_peak_idx), int(other_chan_idx)))
@@ -933,63 +1096,17 @@ class NeuronalAvalanche:
             params_to_analyze['sum_raw'] = avalanche_params.sum_raw
 
         # Configuration for generating xmins for each parameter
-        fit_range_config = {
-            'duration': (1, 20),
-            'sum_raw': (5e-5, 1e-2),
-            'sum_z': (4, 30),
-            'chan_count': (2, 11), 
-            'event_count': (2, 11) 
-        }
+        # fit_range_config = {
+        #     'duration': (1, 20),
+        #     'sum_raw': (5e-5, 1e-2),
+        #     'sum_z': (4, 30),
+        #     'chan_count': (2, 16), 
+        #     'event_count': (2, 16) 
+        # }
 
         # parameter_range= {"alpha": [1., 4.]}
 
-        def generate_log_space_values(start_value, stop_value, num):
-            if start_value == 0:
-                warn('The start value should not be zero due to logarithmic operations. The method returns NaNs.')
-            return np.logspace(np.log10(start_value), np.log10(stop_value), num)
-
-        num_values = 20  # number of values to calculate the fit for
-        def generate_and_sort_fit_ranges(param, num_values, fit_range_config, parameter_values):
-            """ 
-            Helper function for generating the ranges of parameter values
-            over which the power law fit exponent will be calculated. 
-            Its highly similar to the definition of the supports 
-            (pairs of values defining the fit range) are defined in NCC toolbox. 
-            """
-
-            if fit_range_config[param] is None:
-                warn(f"No configuration for parameter '{param}'")
-                return []
-            
-            start_value, stop_value = fit_range_config[param]
-            # if param == 'chan_count':
-            #     values = np.arange(16) + 1
-            # else:
-            values = generate_log_space_values(start_value, stop_value, num_values)
-            pairs = list(itertools.product(values, repeat=2))  # Generate all combinations of values with themselves
-
-            # allocate differnet set of values to xmin and xmax
-            # mid_index = len(values) // 2
-            # first_half = values[:mid_index]
-            # second_half = values[mid_index:]
-            # pairs = list(itertools.product(first_half, second_half)) # Generate all combinations of first_half values with second_half values
-
-            # Constrain to fit within region data
-            constrained_pairs = [
-                pair for pair in pairs 
-                if pair[0] >= min(parameter_values) 
-                and pair[1] <= max(parameter_values) 
-                and pair[1] > pair[0]
-            ]
-            # if not constrained_pairs:
-            #     constrained_pairs = [[max(first_half), min(second_half)]]
-
-            try:
-                sorted_pairs = sorted(constrained_pairs, key=lambda pair: (np.log(pair[1]) - np.log(pair[0])) ** 2, reverse=True)
-            except:
-                sorted_pairs = constrained_pairs
-            
-            return sorted_pairs
+        num_values = 20  # number of samples to use for calculation of (xmin, xmax) pairs
 
         regions = set(avalanche_params.dominant_region)
         regions.discard(None)
@@ -1005,159 +1122,22 @@ class NeuronalAvalanche:
 
                 # Filter data based on region
                 if region != 'overall':
-                    region_data = [d for d, r in zip(data, avalanche_params.dominant_region) if r == region]
+                    region_data = np.array([d for d, r in zip(data, avalanche_params.dominant_region) if r == region])
                 else:
-                    region_data = data
+                    region_data = np.array(data)
 
-                region_data = np.array(region_data)
                 region_data = region_data[~np.isnan(region_data) & ~np.isinf(region_data)]
                 if len(region_data) == 0:
                     continue
-                    
-                # if param == 'chan_count':
-                #     xmins = np.arange(16) + 1
-                # else:
-                    # start_value, stop_value = fit_range_config[param]
-                    # xmins = generate_log_space_values(start_value, stop_value, num_values)
-                fit_ranges = generate_and_sort_fit_ranges(param, num_values, fit_range_config, region_data)
-                # if len(fit_ranges) == 1:
-                #     fit_ranges = [fit_ranges] if isinstance(fit_ranges[0], tuple) else fit_ranges
 
-                alphas, Ds, sigmas, Rs_exp, ps_exp, ps, xmins, xmaxs = [], [], [], [], [], [], [], []
-                
-                ### For investigating the distribution of D, sigma, and R_exp over xmin and xmax
-                # Extract unique xmin and xmax values
-                unique_xmins = sorted(set(x for x, _ in fit_ranges))
-                unique_xmaxs = sorted(set(x for _, x in fit_ranges))
+                # start_value, stop_value = fit_range_config[param]
+                pla = PowerLawAnalyzer(region_data)
+                region_results[param] = pla.compute_power_law_fits(num_values=num_values)
+                # region_results[param] = pla.compute_power_law_fits(start_value, stop_value, num_values)
 
-                # Create mappings from xmin and xmax to their index positions
-                xmin_to_index = {xmin: i for i, xmin in enumerate(unique_xmins)}
-                xmax_to_index = {xmax: j for j, xmax in enumerate(unique_xmaxs)}
-
-                # Initialize 2D array to store alpha, D, sigma, and R_exp values
-                alpha_2d = np.empty((len(unique_xmins), len(unique_xmaxs)))
-                alpha_2d.fill(np.nan)
-
-                D_2d = np.empty((len(unique_xmins), len(unique_xmaxs)))
-                D_2d.fill(np.nan)  # Optional: fill with NaN or other placeholder for clarity
-                
-                sigma_2d = np.empty((len(unique_xmins), len(unique_xmaxs)))
-                sigma_2d.fill(np.nan)
-
-                R_exp_2d = np.empty((len(unique_xmins), len(unique_xmaxs)))
-                R_exp_2d.fill(np.nan)
-                ###
-                for xmin, xmax in fit_ranges: #xmin in xmins:
-                    
-                    # test if enough data is remained after trimming the data to the range (xmin, xmax)
-                    data = trim_to_range(region_data, xmin=xmin, xmax=xmax)
-                    if (len(data) < (len(region_data)/4)) or (len(np.unique(data)) < 3):
-                        continue
-
-                    # fit = powerlaw.Fit(region_data, xmin=xmin, verbose=False)
-                    fit = powerlaw.Fit(
-                        region_data, 
-                        xmin=xmin, 
-                        xmax=xmax, 
-                        # parameter_range=parameter_range, 
-                        verbose=False
-                    )
-
-                    if fit.power_law.D == 0:
-                        print(f'xmin={xmin}, xmax={xmax}, D={fit.power_law.D}')
-                        print('results:')
-
-
-                    xmins.append(xmin)
-                    xmaxs.append(xmax)
-
-                    alphas.append(fit.power_law.alpha)
-                    Ds.append(fit.power_law.D)
-                    sigmas.append(fit.power_law.sigma)
-
-                    # Compare the power_law fit with an exponential fit
-                    R, p_exp = fit.distribution_compare('power_law', 'exponential')
-                    # R is the loglikelihood ratio between the two candidate distributions, and will be positive if the data is more likely in the first distribution                    
-                    Rs_exp.append(R)
-                    ps_exp.append(p_exp)
-
-                    ### 
-                    # Get the indices for the current xmin and xmax
-                    i = xmin_to_index[xmin]
-                    j = xmax_to_index[xmax]
-
-                    # Store the D value in the 2D array
-                    alpha_2d[i, j] = fit.power_law.alpha
-                    D_2d[i, j] = fit.power_law.D
-                    sigma_2d[i, j] = fit.power_law.sigma
-                    R_exp_2d[i, j] = R
-                    ###
-                    
-                    # We might calcualte and append the p-value for the power-law fit
-                    # p = self._calculate_powerlaw_fit_p_value(fit, data, xmin, xmax)
-                    # ps.append(p)
-
-                # find the xmin with the minimum ks-distance (D)
-                D = min(Ds)
-                min_D_idx = Ds.index(D)
-                alpha = alphas[min_D_idx]
-                sigma = sigmas[min_D_idx]
-                R_exp = Rs_exp[min_D_idx]
-                p_exp = ps_exp[min_D_idx]
-                xmin = xmins[min_D_idx]
-                xmax = xmaxs[min_D_idx]
-
-                region_results[param] = PowerLawFitResult(
-                    alpha = alpha,
-                    D = D,
-                    sigma = sigma,
-                    R_exp = R_exp,
-                    p_exp = p_exp,
-                    p = None, # Calculate if needed
-                    xmin = xmin,
-                    xmax = xmax,
-                    alphas = alphas,
-                    Ds = Ds,
-                    sigmas = sigmas,
-                    Rs_exp = Rs_exp,
-                    ps_exp = ps_exp,
-                    ps = ps, # Populate if p-values are to be included
-                    xmins = xmins,
-                    xmaxs = xmaxs,
-                    alpha_2d = alpha_2d,
-                    D_2d = D_2d,
-                    sigma_2d = sigma_2d,
-                    R_exp_2d = R_exp_2d
-                )
             results[region] = region_results
 
         return results if self.region_wise else results['overall']
-    
-    def _calculate_powerlaw_fit_p_value(self, fit, data, xmin, xmax, num_bootstraps=100):
-        """
-        Calculate the p-value of the power-law fit using bootstrapping.
-        
-        Parameters:
-        fit: powerlaw.Fit object
-        num_bootstraps: int, number of bootstrap samples to use (default 1000)
-        
-        Returns:
-        p: float, p-value of the fit
-        """
-        # Get the KS statistic for the power-law fit
-        ks_stat = fit.power_law.D
-        
-        # Generate bootstrap samples
-        bootstrap_ks_stats = []
-        for _ in range(num_bootstraps):
-            bootstrap_sample = np.random.choice(data, size=len(data), replace=True)
-            bootstrap_fit = powerlaw.Fit(bootstrap_sample, xmin=xmin, xmax=xmax, verbose=False)
-            bootstrap_ks_stat = bootstrap_fit.power_law.D
-            bootstrap_ks_stats.append(bootstrap_ks_stat)
-        
-        # Calculate the p-value
-        p_value = np.sum(np.array(bootstrap_ks_stats) > ks_stat) / num_bootstraps
-        return p_value
 
     def size_duration_relationship(self, avalanche_params: AvalancheParams):
         """
@@ -1169,35 +1149,91 @@ class NeuronalAvalanche:
                             and nested dictionaries containing beta coefficient results.
         """
 
+        # def _calculate_beta_coefficients(durations, sizes):
+        #     """Helper function to calculate regression coefficients and p-values"""
+        #     log_durations = np.log10(durations)
+        #     log_sizes = np.log10(sizes)
+        #     log_durations_with_const = sm.add_constant(log_durations)
+        #     model = sm.OLS(log_sizes, log_durations_with_const)
+        #     results = model.fit()
+        #     try:
+        #         return results.params[1], results.pvalues[1]
+        #     except:
+        #         return np.nan, np.nan
+
+        # def _calculate_beta_coefficients(durations, sizes):
+        #     """Helper function to calculate regression coefficients and p-values"""
+        #     # Convert data to pandas DataFrame
+        #     data = pd.DataFrame({'duration': durations, 'size': sizes})
+
+        #     # Group by 'duration' and calculate the mean 'size' for each group
+        #     grouped_data = data.groupby('duration').mean().reset_index()
+
+        #     # Extract the grouped 'size' and averaged 'duration'
+        #     grouped_sizes = grouped_data['size']
+        #     grouped_durations = grouped_data['duration']
+
+        #     # Perform log transformation
+        #     log_durations = np.log10(grouped_durations)
+        #     log_sizes = np.log10(grouped_sizes)
+
+        #     # Perform linear regression
+        #     log_durations_with_const = sm.add_constant(log_durations)
+        #     model = sm.OLS(log_sizes, log_durations_with_const)
+        #     results = model.fit()
+        #     try:
+        #         beta = results.params['duration']
+        #         p_value = results.pvalues['duration']
+        #         intercept = results.params['const']
+        #         return beta, p_value, intercept
+        #     except:
+        #         return np.nan, np.nan, np.nan
         def _calculate_beta_coefficients(durations, sizes):
-            """Helper function to calculate regression coefficients and p-values"""
-            log_durations = np.log10(durations)
-            log_sizes = np.log10(sizes)
+            """Helper function to calculate regression coefficients and p-values with weighted least squares"""
+            # Convert data to pandas DataFrame
+            data = pd.DataFrame({'duration': durations, 'size': sizes})
+
+            # Group by 'duration' and calculate the mean 'size' and count for each group
+            grouped_data = data.groupby('duration').agg(size_mean=('size', 'mean'), count=('size', 'size')).reset_index()
+
+            # Extract the grouped 'size', averaged 'duration', and counts
+            grouped_sizes = grouped_data['size_mean']
+            grouped_durations = grouped_data['duration']
+            weights = grouped_data['count']  # Use count as the weights
+
+            # Perform log transformation
+            log_durations = np.log10(grouped_durations)
+            log_sizes = np.log10(grouped_sizes)
+
+            # Perform weighted least squares regression
             log_durations_with_const = sm.add_constant(log_durations)
-            model = sm.OLS(log_sizes, log_durations_with_const)
+            model = sm.WLS(log_sizes, log_durations_with_const, weights=weights)
             results = model.fit()
             try:
-                return results.params[1], results.pvalues[1]
+                beta = results.params['duration']
+                p_value = results.pvalues['duration']
+                intercept = results.params['const']
+                return beta, p_value, intercept
             except:
-                return np.nan, np.nan
-            
+                return np.nan, np.nan, np.nan
+
         def _calculate_beta_coefficients_in_specified_range(durations, sizes, xmin_duration, xmax_duration, xmin_size, xmax_size):
             """Helper function to first filter the duration and size data and then calculate the beta coefficient"""
             
-            av_subset_idx = np.where(
-                (np.array(durations) >= xmin_duration) &
-                (np.array(durations) <= xmax_duration) &
-                (np.array(sizes) >= xmin_size) &
-                (np.array(sizes) <= xmax_size)
-            )[0]
+            # av_subset_idx = np.where(
+            #     (np.array(durations) >= xmin_duration) &
+            #     (np.array(durations) <= xmax_duration) &
+            #     (np.array(sizes) >= xmin_size) &
+            #     (np.array(sizes) <= xmax_size)
+            # )[0]
             
-            if len(av_subset_idx) > 0:
-                curr_durations = np.array(durations)[av_subset_idx]
-                curr_sizes = np.array(sizes)[av_subset_idx]
-                
-                return _calculate_beta_coefficients(curr_durations, curr_sizes)
-            else:
-                return np.nan, np.nan
+            # if len(av_subset_idx) > 0:
+            curr_durations = np.array(durations)#[av_subset_idx]
+            curr_sizes = np.array(sizes)#[av_subset_idx]
+            
+            return _calculate_beta_coefficients(curr_durations, curr_sizes)
+            # else:
+                # return np.nan, np.nan, np.nan
 
         analysis_results = {}
 
@@ -1240,12 +1276,14 @@ class NeuronalAvalanche:
                 # initialize 2D arrays for beta_coeff and p_value
                 beta_coeff = np.full((num_ranges_duration, num_ranges_size), np.nan)
                 p_value = np.full((num_ranges_duration, num_ranges_size), np.nan)
+                intercept = np.full((num_ranges_duration, num_ranges_size), np.nan)
                 
                 for i_xmin_duration, (xmin_duration, xmax_duration) in enumerate(zip(region_duration_fits.xmins, region_duration_fits.xmaxs)):
                     for i_xmin_size, (xmin_size, xmax_size) in enumerate(zip(region_size_fits.xmins, region_size_fits.xmaxs)):
                         
                         (beta_coeff[i_xmin_duration][i_xmin_size], 
-                         p_value[i_xmin_duration][i_xmin_size]) = _calculate_beta_coefficients_in_specified_range(
+                         p_value[i_xmin_duration][i_xmin_size],
+                         intercept[i_xmin_duration][i_xmin_size]) = _calculate_beta_coefficients_in_specified_range(
                              region_durations, 
                              region_sizes, 
                              xmin_duration, 
@@ -1260,7 +1298,7 @@ class NeuronalAvalanche:
                 optimum_xmin_size = region_size_fits.xmin
                 optimum_xmax_size = region_size_fits.xmax
 
-                optimum_xmin_beta_coeff, optimum_xmin_p_value = _calculate_beta_coefficients_in_specified_range(
+                optimum_xmin_beta_coeff, optimum_xmin_p_value, optimum_xmin_intercept = _calculate_beta_coefficients_in_specified_range(
                     region_durations, 
                     region_sizes, 
                     optimum_xmin_duration, 
@@ -1272,14 +1310,15 @@ class NeuronalAvalanche:
                 region_analysis_results[size_param] = {
                     "beta": {
                         'coeff': beta_coeff,
-                        'p_value': p_value
+                        'p_value': p_value,
+                        'intercept': intercept
                     },
                     "optimum_beta": {
                         'coeff': optimum_xmin_beta_coeff,
-                        'p_value': optimum_xmin_p_value
+                        'p_value': optimum_xmin_p_value,
+                        'intercept': optimum_xmin_intercept
                     }
                 }
-
             analysis_results[region] = region_analysis_results
             
         return analysis_results if self.region_wise else analysis_results['overall']

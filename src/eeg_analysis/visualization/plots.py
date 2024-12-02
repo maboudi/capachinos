@@ -1,6 +1,7 @@
 from src.eeg_analysis.analysis.power_spectral import TimeFrequencyRepresentation
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 def plot_eeg(eeg, sample_rate, threshold, ax, start_time_offset=0, channel_labels=None, detect_avalanche=False, highlight_avalanche_period=False):
     """
@@ -76,7 +77,7 @@ def plot_eeg(eeg, sample_rate, threshold, ax, start_time_offset=0, channel_label
 
     return start_time_offset
 
-def plot_continuous_epochs(tfr, ax=None, **kwargs):
+def plot_continuous_epochs(tfr, ax=None, colorbar=False, **kwargs):
 
     if ax is None:
         raise ValueError("An axis must be provided when plotting multiple epochs")
@@ -87,15 +88,16 @@ def plot_continuous_epochs(tfr, ax=None, **kwargs):
     cumulative_time_offset = 0.0  # Initialize cumulative time offset
 
     # Iterate over the sorted epochs
-    for epoch_key, tfr in tfr.items():
+    for epoch_key, epoch_tfr in tfr.items():
         
-        im = tfr.plot(ax=ax, start_time=cumulative_time_offset, **kwargs)
+        im = epoch_tfr.plot(ax=ax, start_time=cumulative_time_offset, **kwargs)
         
         # Add markers and annotations to indicate epochs
         start_time = cumulative_time_offset
-        end_time = start_time + (tfr.times[-1] - tfr.times[0])
-        ax.axvline(x=start_time, color='w', linestyle='--', linewidth=1)  # Start of epoch
-        ax.axvline(x=end_time, color='w', linestyle='--', linewidth=1)  # End of epoch
+        end_time = start_time + (epoch_tfr.times[-1] - epoch_tfr.times[0])
+        if len(tfr) > 1: # if there are more than one epoch
+            ax.axvline(x=start_time, color='w', linestyle='--', linewidth=1)  # Start of epoch
+            ax.axvline(x=end_time, color='w', linestyle='--', linewidth=1)  # End of epoch
         # ax.text((start_time + end_time) / 2, 50, epoch_key,
         #         horizontalalignment='center', verticalalignment='top',
         #         color='w', fontsize=5, clip_on=True)
@@ -105,7 +107,16 @@ def plot_continuous_epochs(tfr, ax=None, **kwargs):
 
     # ax.set_xlabel('Time (s)')
     # ax.set_ylabel('Frequency (Hz)')
-    fig = ax.get_figure()
-    cbar = fig.colorbar(im, ax=ax, orientation='vertical', label='Power (dB/Hz)', pad=0.01)
-    cbar.outline.set_visible(False)
+    
+    if colorbar:
+        # Create space on the right for the colorbar
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.15)
+        cbar = plt.colorbar(im, cax=cax, orientation='vertical')
+        cbar.set_label('Power (dB/Hz)', fontsize=8)
+        cbar.outline.set_visible(False)
+        cbar.ax.tick_params(labelsize=5)
+
     ax.set_xlim(0, cumulative_time_offset)
+
+    return im

@@ -380,10 +380,10 @@ def plmle(x, *args):
     r = xmin / xmax
     nIterations = int(-np.log10(precision))
 
-    for iIteration in range(nIterations):
+    for iIteration in range(1, int(nIterations) + 1):
         spacing = 10 ** (-iIteration)
         
-        if iIteration == 0:
+        if iIteration == 1:
             taus = np.arange(tauRange[0], tauRange[1] + spacing, spacing)
         else:
             if tauIdx == 0:
@@ -391,7 +391,7 @@ def plmle(x, *args):
             elif tauIdx == len(taus) - 1:
                 taus = np.arange(taus[-2], taus[-1] + spacing, spacing)
             else:
-                taus = np.arange(taus[tauIdx-1], taus[tauIdx+2], spacing)
+                taus = np.arange(taus[tauIdx-1], taus[tauIdx+1], spacing)
         
         nTaus = len(taus)
         
@@ -504,7 +504,7 @@ def plplottool(data, *args, ax=None):
 
     # Create ax if it does not exist
     if ax is None:
-        _, ax = plt.subplots
+        _, ax = plt.subplots()
 
     # Plotting the data
     data_dict = {'x': [], 'fit': []}

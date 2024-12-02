@@ -101,12 +101,12 @@ class EEGFile:
 
         # Use the helper function to define events, explicitly specifying start or end markers or a duration
         event_list = [
-            self.create_event('pre_preop_rest', end_marker='pre-op rest start', duration=120),
+            self.create_event('pre_preop_rest', end_marker='pre-op rest start', duration=1200),
             self.create_event('preop_rest', start_marker='pre-op rest start', end_marker='pre-op rest end'),
             self.create_event('loc', end_marker='loss of consciousness', duration=300),
             self.create_event('pre_incision', end_marker='skin incision', duration= 300),
             self.create_event('maintenance', start_marker='loss of consciousness', end_marker='drug infusion'),
-            self.create_event('pre_drug_infusion', end_marker='drug infusion', duration=600),
+            self.create_event('pre_drug_infusion', end_marker='drug infusion', duration=3000),
             self.create_event('emergence', start_marker='drug infusion', end_marker='extubation'), 
             self.create_event('pacu_rest', start_marker='pacu rest start', end_marker='pacu rest end')
         ]

@@ -2,11 +2,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import mne
 from scipy.signal import filtfilt, spectrogram
-from src.eeg_analysis.utils.helpers import create_mne_raw_from_data 
+from src.eeg_analysis.utils.helpers import create_mne_raw_from_data, select_channels_and_adjust_data
 import warnings
 from statsmodels.tsa.ar_model import AutoReg
 from fooof import FOOOF, FOOOFGroup
 from fooof.sim.gen import gen_aperiodic
+from scipy.ndimage import gaussian_filter1d
 
 class TimeFrequencyRepresentation:
 
@@ -23,8 +24,8 @@ class TimeFrequencyRepresentation:
         times (numpy.ndarray): Array of time points corresponding to the second dimension of the data.
         frequencies (numpy.ndarray): Array of frequencies corresponding to the first dimension of the data.
         whitened_data (numpy.ndarray): The data after whitening transformation has been applied.
-        _slope (float): Parameter for the frequency-domain whitening, representing the slope of the 1/f curve.
-        _intercept (float): Parameter for the frequency-domain whitening, representing the intercept of the 1/f curve.
+        slope (float): Parameter for the frequency-domain whitening, representing the slope of the 1/f curve.
+        intercept (float): Parameter for the frequency-domain whitening, representing the intercept of the 1/f curve.
 
     Methods:
         plot(): Plots the TFR data using matplotlib.
@@ -41,8 +42,16 @@ class TimeFrequencyRepresentation:
         self.data = data
         self.times = times
         self.frequencies = frequencies
-        self._slope = None
-        self._intercept = None
+
+        self.reg_fit_slope = None
+        self.reg_fit_intercept = None
+        self.reg_fit_included_freqs = None
+        self.reg_fit_aperiodic_fit = None
+        
+        self.fooof_periodic_params = None
+        self.fooof_model = None
+        self.fooof_aperiodic_fit = None 
+        self.fooof_aperiodic_fit_slope = None
 
     def plot(self, ax=None, channel=None, start_time=0, vmin=None, vmax=None, cmap='viridis', colorbar=False, add_lables=False, title='Time-Frequency Representation'):
         
@@ -54,6 +63,7 @@ class TimeFrequencyRepresentation:
                 raise ValueError("Multiple channels detected. Please select a channel to plot.")
             # Otherwise, use the data as is (single channel case)
             data_to_plot = self.data
+        data_to_plot[data_to_plot==0] = 1e-16
         
         if ax is None:
             _, ax = plt.subplots()
@@ -92,58 +102,324 @@ class TimeFrequencyRepresentation:
     
         return tfr_average
 
-    def calculate_whitened_tfr(self, baseline_data=None):
+    def calculate_whitened_tfr(self, reg_ap_fit, averaging_win_size=None, averaging_step_size=None, fbands_info=None):
         """
-        Create a whitened compy of the TFR data and returns it.
+        Create a whitened copy of the TFR data and returns it.
         """
         tfr_whitened = TimeFrequencyRepresentation(np.copy(self.data), self.times, self.frequencies)
-        tfr_whitened.whiten(baseline_data)
+        tfr_whitened.whiten(reg_ap_fit, averaging_win_size, averaging_step_size, fbands_info)
 
         return tfr_whitened
 
-    def whiten(self, baseline_data=None):
-        """
-        Apply whitening to the TFR data using a baseline or the entire dataset
-        to calculate the whitening parameters.
+    # def whiten(self, baseline_data=None, fooof_periodic_params=None):
+    #     """
+    #     Apply whitening to the TFR data using a baseline or the entire dataset
+    #     to calculate the whitening parameters.
 
-        - baseline_data: Optional; a 3D numpy array of TFR data from a baseline epoch, 
-                         or a concatenation of multiple epochs if provided.
-        This method alters the TFR data in place.
+    #     - baseline_data: Optional; a 3D numpy array of TFR data from a baseline epoch, 
+    #                      or a concatenation of multiple epochs if provided.
+    #     This method alters the TFR data in place.
 
-        It sets `self.whitened_data` with the whitened TFR data.
-        """
-        self._calculate_whitening_parameters(baseline_data)
+    #     It sets `self.whitened_data` with the whitened TFR data.
+    #     """
+    #     self._calculate_whitening_parameters(baseline_data, fooof_periodic_params)
         
-        # log_freqs = np.log10(self.frequencies)[:, np.newaxis, np.newaxis]  # Reshape for broadcasting
-        freqs = self.frequencies[:, np.newaxis]
-        tfr_data_db = 10 * np.log10(np.abs(self.data))
-        tfr_db_whitened = tfr_data_db - (self._slope * freqs + self._intercept)
-        self.data = 10 ** (tfr_db_whitened / 10)
+    #     freqs = self.frequencies[:, np.newaxis]
+        
+    #     tfr_data_db = 10 * np.log10(np.abs(self.data))
+    #     tfr_db_whitened = tfr_data_db - (self.slope * freqs + self.intercept)
+    #     self.data = 10 ** (tfr_db_whitened / 10)
 
-    def _calculate_whitening_parameters(self, baseline_data=None):
+    def whiten(self, reg_ap_fit=None, averaging_win_size=None, averaging_step_size=None, fbands_info=None):
+        """
+        Apply whitening to the TFR data by subtracting aperiodic fit(s) from the original TFR data.
+
+        Parameters
+        ----------
+        reg_ap_fit : array-like
+            The aperiodic fit(s) to be subtracted from the original TFR data.
+            If the fit is calculated based on the channel-averaged TFRs (for example, in region-averaged TFRs),
+            it could be based on the baseline or the same epoch on which the whitening is applied.
+        averaging_win_size : int
+            The size of each window in samples.
+        averaging_step_size : int
+            The step size of the moving windows in samples.
+        fbands_info : dict, optional
+            Information on the frequency bands for which the power relative to aperiodic fit is calculated.
+            
+        Returns
+        -------
+        None
+            The function updates the `self.data` attribute with the whitened TFR data and sets `self.whitened_data`
+            to store the whitened TFR data.
+
+        >>> NOTE: In the case of overlapping moving windows, it is necessary to convert the moving windows and the corresponding
+        aperiodic fits to non-overlapping windows because whitening needs to be done in non-overlapping time windows.
+        """
+        # Validate inputs
+        if reg_ap_fit is None or averaging_win_size is None or averaging_step_size is None:
+            raise ValueError("Missing required inputs: reg_ap_fit, averaging_win_size, or averaging_step_size")
+
+        def apply_whitening(tfr_db_whitened, tfr_data_db, reg_ap_fit, fit_num_wins, tfr_times, avg_win_size):
+            """
+            Helper function to apply whitening based on the aperiodic fit.
+            """
+            for win_idx in range(fit_num_wins):
+                start_idx = win_idx * avg_win_size
+                end_idx = (win_idx + 1) * avg_win_size
+                curr_win_time_pnt_idx = (tfr_times >= start_idx) & (tfr_times < end_idx)
+                curr_win_num_time_pnts = np.sum(curr_win_time_pnt_idx)
+
+                tfr_num_channels = tfr_data_db.shape[2]
+
+                curr_win_reg_ap_fit = reg_ap_fit[:, win_idx, :]
+                if curr_win_reg_ap_fit.ndim == 2:
+                    curr_win_reg_ap_fit = curr_win_reg_ap_fit[:, :, np.newaxis]
+                curr_win_reg_ap_fit_broadcasted = np.tile(curr_win_reg_ap_fit, (1, curr_win_num_time_pnts, tfr_num_channels))
+                tfr_db_whitened[:, curr_win_time_pnt_idx, :] = tfr_data_db[:, curr_win_time_pnt_idx, :] - curr_win_reg_ap_fit_broadcasted
+
+            return tfr_db_whitened
+
+        tfr_data_db = 10 * np.log10(np.abs(self.data))
+
+        if tfr_data_db.ndim < 3:
+            tfr_data_db = tfr_data_db[:, :, np.newaxis]
+
+        num_freqs, num_time_pnts, num_channels = tfr_data_db.shape
+
+        # extract the the aperiodic fits corresponding to non-overlapping windows
+        step_factor = averaging_win_size // averaging_step_size
+        if reg_ap_fit.shape[1] > 1:
+            reg_ap_fit = reg_ap_fit[:, ::step_factor, :]
+
+        _, fit_num_wins, fit_num_channels = reg_ap_fit.shape
+
+        tfr_db_whitened = np.full((num_freqs, num_time_pnts, num_channels), np.nan)
+            
+        if fit_num_channels == 1: # when the fit is calculated based on channel_averaged TFRs like in region_avg TFR. 
+            # The fit calculation could be based on the data during the baseline or the epoch that the whitening is applied on. The data on which the whitening is applied on can be chan averaged or not. 
+            if fit_num_wins == 1: # when baseline is used for fit calculation
+                curr_reg_ap_fit = reg_ap_fit[:, 0, 0]
+                reg_ap_fit_broadcasted = np.tile(curr_reg_ap_fit[:, np.newaxis, np.newaxis], (1, num_time_pnts, num_channels))
+                tfr_db_whitened = tfr_data_db - reg_ap_fit_broadcasted            
+
+            else: # when the aperiodic fit is calculated using the same data that is whitening is applied on
+                apply_whitening(tfr_db_whitened, tfr_data_db, reg_ap_fit, fit_num_wins, self.times, averaging_win_size)      
+        else:
+            if fit_num_channels != num_channels:
+                raise ValueError("Inconsistency in the number of channels between the TFR data and the aperiodic_fit array")
+            
+            if fit_num_wins == 1: # fit based on baseline 
+                for chan_idx in range(num_channels):
+                    curr_reg_ap_fit = reg_ap_fit[:, 0, chan_idx]
+                    reg_ap_fit_broadcasted = np.tile(curr_reg_ap_fit[:, np.newaxis, np.newaxis], (1, num_time_pnts, num_channels))
+                    tfr_db_whitened[:, :, chan_idx] = tfr_data_db[:, :, chan_idx] - reg_ap_fit_broadcasted 
+
+            else: # aperiodic fit is based on the same data
+                for chan_idx in range(num_channels):
+                    tfr_db_whitened[:, :, chan_idx] = apply_whitening(tfr_db_whitened, tfr_data_db, reg_ap_fit[:, :, chan_idx], fit_num_wins, self.times, averaging_win_size)
+        
+        self.data = 10 ** (tfr_db_whitened / 10)
+        self.whitened_data = self.data  # Assuming `self.whitened_data` needs to store the whitened data
+
+    def calculate_whitening_parameters(self, baseline_data=None, per_channel=False, exclude_fbands=True, peak_threshold=0.1, window_size=None, step_size=None, fbands=None, freq_range=None, fooof_aperidoc_freq_start=None):
         """
         Calculates whitening parameters based on the provided baseline data or the current instance data.
+
+        Parameters:
+        baseline_data (Optional[np.ndarray]): Baseline data to calculate whitening parameters from.
+        fooof_periodic_params (Optional[Dict]): Information about frequency bands to exclude.
+        per_channel (bool): Whether to calculate separate slopes and intercepts for each channel if baseline data is provided or per window.
+        freq_range (List[int]): Frequency range for fitting linear models, default is [7, 35] Hz.
+
+        excluded_fbands are only used when no baseline_data is specified. 
+        If baseline_data is provided, the FOOOF parameters and therefore excluded_fbands are calculated for the average baseline power spectral density.   
+
         """
-        if baseline_data is None:
-            baseline_data = self.data
-
         freqs = self.frequencies
+        num_frequencies = len(freqs)
 
-        # Identify non-outlier time points and calculate mean spectral power
-        mean_spectral_power, _ = TimeFrequencyRepresentation._calculate_mean_spectral_power_with_outlier_removal(
-            baseline_data
-        )
-        tfr_db = 10 * np.log10(mean_spectral_power)
+        if freq_range is None:
+            freq_range = [7, 35]
 
-        # Fit a linear model (in log-log space) to calculate slope and intercept
-        # log_freqs = np.log10(freqs)
-        # slope, intercept = np.polyfit(log_freqs, tfr_db, 1)
-        slope, intercept = np.polyfit(freqs, tfr_db, 1)
+        def calculate_included_freqs(excluded_fbands, freqs, freq_range, curr_chan_idx = None, current_win_idx=None):
+            if curr_chan_idx is None:
+                curr_chan_idx = 0
+            if current_win_idx is None:
+                current_win_idx = 0
 
-        self._slope = slope
-        self._intercept = intercept
+            included_freqs_idx = np.full((len(freqs), ), True)
+            for fband, band_params in excluded_fbands.items():
+                lower_bound = 0 if fband == 'delta' else band_params['lower_bound'][curr_chan_idx, current_win_idx]
+                upper_bound = 4 if fband == 'delta' else band_params['upper_bound'][curr_chan_idx, current_win_idx]
+
+                if not np.isnan(lower_bound) and not np.isnan(upper_bound):
+                    included_freqs_idx *= ((freqs <= lower_bound) | (freqs >= upper_bound)) & (freqs > freq_range[0]) & (freqs < freq_range[1])
+
+            return included_freqs_idx
+        
+
+        included_freqs_idx = np.full((len(freqs), ), True)
+
+        if baseline_data is not None: 
+
+            if baseline_data.dim == 3 and per_channel:
+
+                num_channels = baseline_data.shape[2]
+                num_wins = 1  # Since we're averaging over windows
+
+                self.reg_fit_slope = np.full((num_wins, num_channels), np.nan)
+                self.reg_fit_intercept = np.full((num_wins, num_channels), np.nan)
+                self.reg_fit_included_freqs = np.full((num_frequencies, num_wins, num_channels), np.nan, dtype=bool)
+                self.reg_fit_aperiodic_fit = np.full((num_frequencies, num_wins, num_channels), np.nan)
+
+                # averge over the time axis following removel of outlier time points
+                mean_spectral_power, _ = TimeFrequencyRepresentation._calculate_mean_spectral_power_with_outlier_removal(
+                    baseline_data, axis=1
+                )
+
+                for chan_idx in range(num_channels):
+                    curr_chan_mean_spectral_power = mean_spectral_power[:, :, chan_idx]
+
+                    psd_db = 10 * np.log10(curr_chan_mean_spectral_power)
+
+                    if exclude_fbands: 
+                        # Calculate the FOOOF periodic parameters
+                        # NOTE: no need to return the FOOOF aperiodic component and the drived slope from the baseline data
+                        fooof_periodic_params, _, _, _ = self.calculate_periodic_parameters(
+                            tfr_data=curr_chan_mean_spectral_power, fbands=fbands, peak_threshold=peak_threshold, overlap_threshold=0.5
+                        )
+                        included_freqs_idx = calculate_included_freqs(fooof_periodic_params, freqs, freq_range=freq_range)
+                        
+                    # Fit a linear model (in log power-linear frequency space) to calculate slope and intercept
+                    self.reg_fit_slope[0, chan_idx], self.reg_fit_intercept[0, chan_idx] = np.polyfit(
+                        freqs[included_freqs_idx], psd_db[included_freqs_idx], 1
+                    )
+                    self.reg_fit_included_freqs[:, 0, chan_idx] = included_freqs_idx
+                    self.reg_fit_aperiodic_fit[:, 0, chan_idx] = (
+                        self.reg_fit_intercept[0, chan_idx] + self.reg_fit_slope[0, chan_idx] * freqs
+                    )
+
+            else:
+                num_channels = 1
+                num_wins = 1  # Since we're averaging over windows
+
+                self.reg_fit_slope = np.full((num_wins, num_channels), np.nan)
+                self.reg_fit_intercept = np.full((num_wins, num_channels), np.nan)
+                self.reg_fit_included_freqs = np.full((num_frequencies, num_wins, num_channels), np.nan, dtype=bool)
+                self.reg_fit_aperiodic_fit = np.full((num_frequencies, num_wins, num_channels), np.nan)
+
+                mean_spectral_power, _ = TimeFrequencyRepresentation._calculate_mean_spectral_power_with_outlier_removal(
+                    baseline_data   
+                )
+
+                psd_db = 10 * np.log10(mean_spectral_power)
+
+                if exclude_fbands:
+                    fooof_periodic_params, _, _, _= self.calculate_periodic_parameters(
+                        tfr_data=mean_spectral_power, fbands=fbands, peak_threshold=peak_threshold, overlap_threshold=0.5
+                    )
+                    included_freqs_idx = calculate_included_freqs(fooof_periodic_params, freqs, freq_range=freq_range) 
+                
+                self.reg_fit_slope[0, 0], self.reg_fit_intercept[0, 0] = np.polyfit(
+                    freqs[included_freqs_idx], psd_db[included_freqs_idx], 1
+                )
+                self.reg_fit_included_freqs[:, 0, 0] = included_freqs_idx
+                self.reg_fit_aperiodic_fit[:, 0, 0] = (
+                    self.reg_fit_intercept[0, 0] + self.reg_fit_slope[0, 0] * freqs
+                )
+
+        else: # no baseline data for calculation of slope. The regression line parameters are calculated for each individual window and used later for whitening or other procedures
+            
+            if window_size is None:
+                raise ValueError('Window size is missing for calculation of FOOOF periodic parameters')
+
+            tfr_windowed, _, _ = self.calculate_window_average(window_size, step_size)
+            _, num_wins, num_channels = tfr_windowed.shape
+
+            self.reg_fit_slope = np.full((num_wins, num_channels), np.nan)
+            self.reg_fit_intercept = np.full((num_wins, num_channels), np.nan)
+            self.reg_fit_included_freqs = np.full((num_frequencies, num_wins, num_channels), np.nan, dtype=bool)
+            self.reg_fit_aperiodic_fit = np.full((num_frequencies, num_wins, num_channels), np.nan)
+
+            if self.data.ndim == 3 and per_channel:
+
+                if exclude_fbands: 
+                    self.fooof_periodic_params, self.fooof_model, self.fooof_aperiodic_fit, self.fooof_aperiodic_fit_slope = self.calculate_periodic_parameters(
+                        tfr_data=tfr_windowed, fbands=fbands, peak_threshold=peak_threshold, overlap_threshold=0.5, aperiodic_fit_start_frequency=fooof_aperidoc_freq_start
+                    )
+
+                for chan_idx in range(num_channels):
+                    for win_idx in range(num_wins):
+                        psd_db = 10 * np.log10(tfr_windowed[:, win_idx ,chan_idx])
+
+                        if exclude_fbands:
+                            included_freqs_idx = calculate_included_freqs(
+                                self.fooof_periodic_params, freqs, freq_range=freq_range, curr_chan_idx=chan_idx, current_win_idx=win_idx
+                            )
+                        
+                        self.reg_fit_slope[win_idx, chan_idx], self.reg_fit_intercept[win_idx, chan_idx] = np.polyfit(
+                            freqs[included_freqs_idx], psd_db[included_freqs_idx], 1
+                        )
+                        self.reg_fit_included_freqs[:, win_idx, chan_idx] = included_freqs_idx
+                        self.reg_fit_aperiodic_fit[:, win_idx, chan_idx] = (
+                            self.reg_fit_intercept[win_idx, chan_idx] + self.reg_fit_slope[win_idx, chan_idx] * freqs
+                        )
+            else:
+                num_channels = 1
+
+                # take an average of the windowed tfr data over all channels 
+                mean_spectral_power, _ = TimeFrequencyRepresentation._calculate_mean_spectral_power_with_outlier_removal(
+                    tfr_windowed, axis=2, remove_outliers=False
+                )
+
+                if exclude_fbands:
+                    self.fooof_periodic_params, self.fooof_model, self.fooof_aperiodic_fit, self.fooof_aperiodic_fit_slope = self.calculate_periodic_parameters(
+                        tfr_data=mean_spectral_power, fbands=fbands, peak_threshold=peak_threshold, overlap_threshold=0.5, aperiodic_fit_start_frequency=fooof_aperidoc_freq_start
+                    )
+
+                for win_idx in range(num_wins):
+                    curr_win_mean_spectal_power = mean_spectral_power[:, win_idx]
+                    psd_db = 10 * np.log10(curr_win_mean_spectal_power)
+
+                    if exclude_fbands:
+                        included_freqs_idx = calculate_included_freqs(
+                            self.fooof_periodic_params, freqs, freq_range=freq_range, current_win_idx=win_idx
+                        )
+                    
+                    self.reg_fit_slope[win_idx, 0], self.reg_fit_intercept[win_idx, 0] = np.polyfit(
+                        freqs[included_freqs_idx], psd_db[included_freqs_idx], 1
+                    )
+                    self.reg_fit_included_freqs[:, win_idx, 0] = included_freqs_idx
+                    self.reg_fit_aperiodic_fit[:, win_idx, 0] = (
+                        self.reg_fit_intercept[win_idx, 0] + self.reg_fit_slope[win_idx, 0] * freqs
+                    )
+                
+
+    # def _calculate_whitening_parameters(self, baseline_data=None):
+    #     """
+    #     Calculates whitening parameters based on the provided baseline data or the current instance data.
+    #     """
+    #     if baseline_data is None:
+    #         baseline_data = self.data
+
+    #     freqs = self.frequencies
+
+    #     # Identify non-outlier time points and calculate mean spectral power
+    #     mean_spectral_power, _ = TimeFrequencyRepresentation._calculate_mean_spectral_power_with_outlier_removal(
+    #         baseline_data
+    #     )
+    #     tfr_db = 10 * np.log10(mean_spectral_power)
+
+    #     # Fit a linear model (in log-log space) to calculate slope and intercept
+    #     # log_freqs = np.log10(freqs)
+    #     # slope, intercept = np.polyfit(log_freqs, tfr_db, 1)
+    #     slope, intercept = np.polyfit(freqs, tfr_db, 1)
+
+    #     self.slope = slope
+    #     self.intercept = intercept
     
-    def calculate_window_average(self, window_size, step_size):
+    def calculate_window_average(self, window_size, step_size=None, smoothing_sigma=3):
         """
         Calculate average TFRs within each window
 
@@ -156,6 +432,8 @@ class TimeFrequencyRepresentation:
         tfr_std (np.ndarray): standard deviation of spectral power for each channel within each window
         window_centers (np.ndarray): array of center times for each window
         """ 
+        if step_size is None:
+            step_size = window_size
 
         tfr_data = self.data
         if tfr_data.ndim == 2: 
@@ -179,10 +457,14 @@ class TimeFrequencyRepresentation:
             for chn_idx in range(num_channels):
                 segment = tfr_data[:, in_window, chn_idx]
                 mean_power, std_power = TimeFrequencyRepresentation._calculate_mean_spectral_power_with_outlier_removal(segment)
+                
+                # Smoothing the mean_spectrum 
+                mean_power = gaussian_filter1d(mean_power, smoothing_sigma)
+                
                 tfr_mean[:, win_idx, chn_idx] = mean_power
                 tfr_std[:, win_idx, chn_idx] = std_power
 
-        return tfr_mean, tfr_std, np.array(window_centers)
+        return tfr_mean, tfr_std, np.array(window_centers), 
 
     def calculate_aperiodic_parameters(self, freq_range=None, aperiodic_mode='fixed'):
         """
@@ -213,7 +495,12 @@ class TimeFrequencyRepresentation:
 
         for chn_idx in range(num_channels):
             fooof_model = FOOOFGroup(aperiodic_mode=aperiodic_mode, verbose=False)
-            fooof_model.fit(tfr_freqs, tfr_data[:, :, chn_idx].T, freq_range=freq_range)
+            try:
+                fooof_model.fit(tfr_freqs, tfr_data[:, :, chn_idx].T, freq_range=freq_range)
+            except:
+                array = tfr_data[:, :, chn_idx].T.flatten()
+                rr = np.where(~np.isnan(array))[0]
+                continue
 
             parameters = fooof_model.get_params('aperiodic_params')
 
@@ -231,7 +518,7 @@ class TimeFrequencyRepresentation:
 
         return fooof_aperiodic_parameters
     
-    def calculate_periodic_parameters(self, freq_range=None, bands=None, aperiodic_mode='knee', peak_threshold=1.5, overlap_threshold=0.25):
+    def calculate_periodic_parameters(self, tfr_data, freq_range=None, fbands=None, aperiodic_mode='knee', peak_threshold=1.5, overlap_threshold=0.25, aperiodic_fit_start_frequency=None):
         """
         Calculate the periodic paramters given the bands.
         The method utilizes FOOOF for fitting peak within the bands, after subtracting the 
@@ -244,11 +531,25 @@ class TimeFrequencyRepresentation:
         """
         if freq_range is None:
             freq_range = [0.5, self.frequencies[-1]]
-        
-        if not bands:
-            raise ValueError("Bands need to be defiend as a dictionary with band names and frequency ranges.")
 
-        tfr_data = self.data
+        if aperiodic_fit_start_frequency is None:
+            aperiodic_fit_start_frequency = 10
+        
+        # if fbands is None:
+        #     fbands = {
+        #         'delta': [0.5, 4],
+        #         'theta': [4, 7],
+        #         'alpha':[7, 14],
+        #         'beta': [18, 35],
+        #         'gamma':[35, 55]
+        #     }
+        #     warnings.warn("No frequency band was specified to initialize calculation of FOOOF aperiodic parametes, so default bands will be used")
+        
+
+        # Sort the bands based on the first frequency
+        fbands = dict(sorted(fbands.items(), key=lambda item: item[1][0]))
+
+        # tfr_data = self.data
         if tfr_data.ndim == 2: 
             tfr_data = tfr_data[..., np.newaxis]
         
@@ -256,16 +557,17 @@ class TimeFrequencyRepresentation:
         tfr_freqs = self.frequencies
 
         # Initialize a structure to store FOOOF models only if the conditions are met
-        if num_time_points <= 50 and num_channels == 1:
-            fooof_models = {}
-        else:
-            warnings.warn(f"Not storing the fooof_models due to the number of spectrums given the number of time windows ({num_time_points}) and channels ({num_channels}).")
-            fooof_models = None
+        fooof_model = {}
+        # if num_time_points <= 50 and num_channels == 1:
+        #     fooof_model = {}
+        # else:
+        #     warnings.warn(f"Not storing the fooof_model due to the number of spectrums given the number of time windows ({num_time_points}) and channels ({num_channels}).")
+        #     fooof_model = None
         
          # Initialize a structure to store the periodic parameters for all channels, time points, and bands.
         nan_array = np.full((num_channels, num_time_points), np.nan)
         fooof_periodic_params = {
-            band: {
+            fband: {
                 key: nan_array.copy() for key in (
                     'cf', 
                     'amplitude', 
@@ -276,54 +578,119 @@ class TimeFrequencyRepresentation:
                     'avg_power_relative'
                     )
             }
-            for band in bands
+            for fband in fbands
         }
+        aperiodic_fit = {}
+        aperiodic_fit_slope = nan_array.copy()
 
         for chn_idx in range(num_channels):
             for time_pt in range(num_time_points):
                 # Fit FOOOF model
-                fooof_model = FOOOF(aperiodic_mode=aperiodic_mode, peak_threshold=peak_threshold, verbose=False)
-                fooof_model.fit(tfr_freqs, tfr_data[:, time_pt, chn_idx], freq_range=freq_range)
+                curr_fooof_model = FOOOF(
+                    aperiodic_mode=aperiodic_mode, peak_threshold=peak_threshold, verbose=False
+                )
 
-                if fooof_models is not None:
-                    fooof_models[(chn_idx, time_pt)] = fooof_model
+                try:
+                    curr_fooof_model.fit(
+                        tfr_freqs, tfr_data[:, time_pt, chn_idx], freq_range=freq_range
+                    )
+
+                except:
+                    print(f'Error fitting FOOOF model')
+                    continue
+
+                if curr_fooof_model is not None:
+                    fooof_model[(chn_idx, time_pt)] = curr_fooof_model
                 
-                # aperiodic_params = fooof_model.get_params('aperiodic_params')
-                # aperiodic_fit = self._aperiodic_fit(tfr_freqs, aperiodic_params)
-                # aperiodic_fit = fooof_model._ap_fit
-                aperiodic_fit = gen_aperiodic(fooof_model.freqs, fooof_model._robust_ap_fit(fooof_model.freqs, fooof_model.power_spectrum))
+                    # aperiodic_params = fooof_model.get_params('aperiodic_params')
+                    # aperiodic_fit = self._aperiodic_fit(tfr_freqs, aperiodic_params)
+                    # aperiodic_fit = fooof_model._ap_fit
+                    # try:
+                    curr_aperiodic_fit = gen_aperiodic(
+                        curr_fooof_model.freqs, curr_fooof_model._robust_ap_fit(curr_fooof_model.freqs, curr_fooof_model.power_spectrum)
+                    )
 
-                # Loop over bands and store the peak parameters
-                for band_label, freq_band in bands.items():
-                    if band_label != 'delta': 
-                        extracted_peak = self._extract_highest_peak_in_band(fooof_model, freq_band, overlap_threshold=overlap_threshold)
-                        if extracted_peak:         
-                            fooof_periodic_params[band_label]['cf'][chn_idx, time_pt] = extracted_peak[0][0]
-                            fooof_periodic_params[band_label]['amplitude'][chn_idx, time_pt] = extracted_peak[0][1]
-                            fooof_periodic_params[band_label]['bw'][chn_idx, time_pt] = extracted_peak[0][2]
-                            fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = extracted_peak[0][3]
-                            fooof_periodic_params[band_label]['upper_bound'][chn_idx, time_pt] = extracted_peak[0][4]
+                    # Loop over bands and store the peak parameters
+                    prev_upper_bound = np.nan
+                    prev_band_label = None
+                    for band_label, freq_band in fbands.items():
+                        if band_label != 'delta':
+                            if band_label in ['beta']:
+                                bandwidth_factor = 1/1.5
+                            elif band_label in ['gamma']:
+                                bandwidth_factor = 1/6
+                            # elif band_label == 'theta':
+                            #     bandwidth_factor = 1/20
+                            else:
+                                bandwidth_factor = 1/4
 
-                            lower_bound, upper_bound = extracted_peak[0][3], extracted_peak[0][4]
-                        else:
-                            lower_bound, upper_bound = freq_band[0], freq_band[1]
-                    else:
-                        lower_bound, upper_bound = freq_band[0], freq_band[1]
+                            extracted_peak = self._extract_highest_peak_in_band(
+                                curr_fooof_model, freq_band, bandwidth_factor, overlap_threshold=overlap_threshold
+                            )
+                            
+                            if ~np.all(np.isnan(np.array(extracted_peak))):         
+                                fooof_periodic_params[band_label]['cf'][chn_idx, time_pt] = extracted_peak[0][0]
+                                fooof_periodic_params[band_label]['amplitude'][chn_idx, time_pt] = extracted_peak[0][1]
+                                fooof_periodic_params[band_label]['bw'][chn_idx, time_pt] = extracted_peak[0][2]
+                                lower_bound = extracted_peak[0][3]
+                                upper_bound = extracted_peak[0][4]
+                            else:
+                                upper_bound = np.nan
+                                lower_bound = np.nan
+                                # print(f"No peak found in band {band_label} for channel {chn_idx} at time {time_pt}.")
+                        
+                            fooof_periodic_params[band_label]['upper_bound'][chn_idx, time_pt] = upper_bound
 
-                    band_mask = (tfr_freqs >= lower_bound) & (tfr_freqs <= upper_bound)
+                            if (~np.isnan(prev_upper_bound)) and (prev_band_label is not None):
+                                if lower_bound <= prev_upper_bound:
+                                    if band_label in ['beta']:
+                                        fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = prev_upper_bound + 1
+                                    else:
+                                        middle_value = (lower_bound + prev_upper_bound)/2
+                                        lower_bound = middle_value
+                                        fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = middle_value + 0.5
+                                        fooof_periodic_params[prev_band_label]['upper_bound'][chn_idx, time_pt] = middle_value - 0.5
+                                else:
+                                    fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = lower_bound
+                            else:
+                                fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = lower_bound
+
+                            if ~np.isnan(upper_bound):
+                                prev_upper_bound = upper_bound
+                                prev_band_label = band_label
 
                     # Calculate absolute and relative (to the aperiodic component) power
-                    if band_mask.any():
-                        power_absolute = np.mean(fooof_model.power_spectrum[band_mask])
-                        power_relative = np.mean(fooof_model.power_spectrum[band_mask] - aperiodic_fit[band_mask])
-                    else:
-                        power_absolute = np.nan
-                        power_relative = np.nan
-                    
-                    fooof_periodic_params[band_label]['avg_power_absolute'][chn_idx, time_pt] = power_absolute
-                    fooof_periodic_params[band_label]['avg_power_relative'][chn_idx, time_pt] = power_relative
-        
-        return fooof_periodic_params, fooof_models
+                    for band_label in fooof_periodic_params.keys():
+
+                        if band_label != 'delta':
+                            lower_bound = fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt]
+                            upper_bound = fooof_periodic_params[band_label]['upper_bound'][chn_idx, time_pt]
+                        else:
+                            lower_bound, upper_bound = fbands[band_label]
+
+                        if lower_bound is not None and upper_bound is not None:
+                            band_mask = (tfr_freqs >= lower_bound) & (tfr_freqs <= upper_bound)
+
+                            if band_mask.any():
+                                power_absolute = np.mean(curr_fooof_model.power_spectrum[band_mask])
+                                power_relative = np.mean(curr_fooof_model.power_spectrum[band_mask] - curr_aperiodic_fit[band_mask])
+                            else:
+                                power_absolute = np.nan
+                                power_relative = np.nan
+                            
+                            fooof_periodic_params[band_label]['avg_power_absolute'][chn_idx, time_pt] = power_absolute
+                            fooof_periodic_params[band_label]['avg_power_relative'][chn_idx, time_pt] = power_relative
+
+                    aperiodic_fit[(chn_idx, time_pt)] = curr_aperiodic_fit
+
+                    freq_includ_idx = np.where(self.frequencies > aperiodic_fit_start_frequency)[0]
+                    slope, _ = np.polyfit(self.frequencies[freq_includ_idx], curr_aperiodic_fit[freq_includ_idx], 1)
+                    aperiodic_fit_slope[chn_idx, time_pt] = -10*slope # since aperiodc_fit is of the type log(power). So, to calculate in dB we need to multiply by 10
+
+                    # except:
+                    #     print('Faining to process FOOOF model for the current window/time point')
+
+        return fooof_periodic_params, fooof_model, aperiodic_fit, aperiodic_fit_slope
 
     # def _aperiodic_fit(self, freqs, params):
     #     """
@@ -387,7 +754,7 @@ class TimeFrequencyRepresentation:
         combine_bw = combine_bw_end - combine_bw_start
         return (highest_peak[0], highest_peak[1], combine_bw, combine_bw_start, combine_bw_end)
     
-    def _extract_highest_peak_in_band(self, fooof_model, freq_band, overlap_threshold):
+    def _extract_highest_peak_in_band(self, fooof_model, freq_band, band_width_factor, overlap_threshold):
         """
         Extracts the highest peak within a specified frequency band from FOOOF results.
 
@@ -407,9 +774,10 @@ class TimeFrequencyRepresentation:
                 gaussian_kernel_sd = peaks[peak_idx, 2]/(2*np.sqrt(2 * np.log(2)))
                 
                 # Full bandwidth is ±3 SD
-                X = 1/4
-                full_bw = 2 * gaussian_kernel_sd * np.sqrt(-2 * np.log(X))
-                # full_bw = 4*gaussian_kernel_sd
+                X = band_width_factor
+                full_bw = 2. * gaussian_kernel_sd * np.sqrt(-2 * np.log(X)) 
+                
+                # full_bw = 2*1.96*gaussian_kernel_sd
 
                 # Assign the full width to the bandwidth column
                 peaks[peak_idx, 2] = full_bw
@@ -431,22 +799,30 @@ class TimeFrequencyRepresentation:
         return highest_peaks_with_overlaps
 
     @staticmethod
-    def _calculate_mean_spectral_power_with_outlier_removal(tfr_data):
+    def _calculate_mean_spectral_power_with_outlier_removal(tfr_data, axis=None, remove_outliers=True):
         """
         Identifies outlier time points and calculates the mean spectral power,
         excluding those outliers.
+
+        axes: axis along which the avaeraging is applied
         """
         if tfr_data.ndim < 3: #if processing channel average data
             tfr_data = tfr_data[..., np.newaxis]
 
+        if axis is None:
+            axis = (1, 2)
+
         tfr_magnitude = np.abs(tfr_data)
         sum_over_freq_and_channels = np.sum(tfr_magnitude, axis=(0, 2))
 
-        non_outlier_time_indices = TimeFrequencyRepresentation._identify_non_outlier_time_indices(sum_over_freq_and_channels)
-        tfr_filtered = tfr_magnitude[:, non_outlier_time_indices, :]
+        if remove_outliers:
+            non_outlier_time_indices = TimeFrequencyRepresentation._identify_non_outlier_time_indices(sum_over_freq_and_channels)
+            tfr_filtered = tfr_magnitude[:, non_outlier_time_indices, :]
+        else:
+            tfr_filtered = tfr_magnitude
 
-        mean_spectral_power = np.mean(tfr_filtered, axis=(1, 2))
-        std_spectral_power = np.std(tfr_filtered, axis=(1, 2))
+        mean_spectral_power = np.mean(tfr_filtered, axis=axis)
+        std_spectral_power = np.std(tfr_filtered, axis=axis)
 
         return mean_spectral_power, std_spectral_power
     
@@ -502,7 +878,10 @@ class PowerSpectralAnalysis:
         >>> psa.postprocess_frequency_domain_whitening(baseline_epoch_name='preop_rest')
     """
 
-    def __init__(self, eeg_file, window_size=None, step_size=None):
+    def __init__(self, 
+                 eeg_file, 
+                 window_size=None, 
+                 step_size=None):
         """
         Initialize the PowerSpectralAnalysis with (preprocessed) EEG data.
         """
@@ -510,27 +889,42 @@ class PowerSpectralAnalysis:
         self.eeg_data = eeg_file.eeg_data
         self.channel_names = eeg_file.channel_names
         self.channel_groups = eeg_file.channel_groups
+        self.sampling_frequency = eeg_file.sampling_frequency
+
+        # self.select_channels = None
+        self.select_channel_names = None
+
         self.whitened_eeg = None
         self.time_domain_whitened = False
-        self.sampling_frequency = eeg_file.ds_sampling_frequency if hasattr(eeg_file, 'ds_sampling_frequency') else eeg_file.sampling_frequency      
+              
         self.freq_resolution = 0.5
         self.frequencies = np.arange(0.5, 55.5, self.freq_resolution) 
 
         window_size_samples = window_size*self.sampling_frequency if window_size else int(self.sampling_frequency)
         step_size_samples = step_size*self.sampling_frequency if step_size else window_size_samples // 2
         self.nperseg = window_size_samples
-        self.noverlap = step_size_samples
+        self.time_step = step_size
+        self.noverlap = (window_size_samples - step_size_samples)/self.sampling_frequency
 
-        self.time_step = (self.nperseg - self.noverlap) / self.sampling_frequency
         self.tfr = {}
-        self.whitened_tfr = {}
         
+        self.whitened_tfr = {}
+        self.whitened_tfr = {}
+        self.regression_ap_fit = {}
+        self.regresssion_ap_fit_slope = {}
+        self.regression_ap_fit_intercept = {}
+        self.regression_ap_fit_included_freqs = {}
+
         self.region_average_tfr = {}
         self.window_average_tfr = {}
 
         self.fooof_aperiodic_parameters = {}
         self.fooof_periodic_parameters = {}
-        self.fooof_models = None
+        self.fooof_model = {}
+        self.fooof_aperiodic_fit = {}
+        self.fooof_aperiodic_fit_slope = {}
+
+        self.fband_power_relative_reg_ap = {}
 
     def preprocess_time_domain_whitening(self, AR_order=2, baseline_epoch_name=None, concatenate_data=False, window_size=None, coeff_mode='average'):
         """
@@ -553,7 +947,7 @@ class PowerSpectralAnalysis:
         - If baseline_epoch_name and concatenate_data are not specified, each epoch is whitened based on the AR parameters calculated during the same epoch.
         Further windowing is applied if window_size is set. 
 
-        >>> TO DO: in the average mode make sure that the average is calculated after excluding non-EEG channels
+        >>> NOTE: in the average mode make sure that the average is calculated after excluding non-EEG channels
         """
 
         # Verify whether EEG data is epoched or continuous
@@ -710,13 +1104,14 @@ class PowerSpectralAnalysis:
                 raise ValueError(f'The following selected epochs are not available: {missing_epochs}')
 
             # Calculate TFR for each epoch in epochs_to_process
-            for epoch_name in epochs_to_process:
+            for epoch_idx, epoch_name in enumerate(epochs_to_process):
                 epoch_data = data_source[epoch_name]
-                self.tfr[epoch_name], self.channel_names = self._calculate_epoch_tfr(epoch_data, method, select_channels)
-        
+                self.tfr[epoch_name], chan_names = self._calculate_epoch_tfr(epoch_data, method, select_channels)
+                if epoch_idx == 0:
+                    self.select_channel_names = chan_names
         # If data_source in continuous EEG data 
         else:
-            self.tfr, self.channel_names = self._calculate_epoch_tfr(data_source, method, select_channels)
+            self.tfr, self.select_channel_names = self._calculate_epoch_tfr(data_source, method, select_channels)
 
     def _calculate_epoch_tfr(self, epoch_data, method, select_channels):
 
@@ -733,7 +1128,7 @@ class PowerSpectralAnalysis:
         elif method.lower()=='morlet':
             tfr = self._calculate_morlet_tfr(raw)            
         elif method.lower()=='spectrogram':
-            tfr = self._calculate_spectrogram_tfr(epoch)
+            tfr = self._calculate_spectrogram_tfr(raw)
         else:
             raise ValueError("Unsupported time-frequency representation method: {}".format(method))
         
@@ -743,7 +1138,7 @@ class PowerSpectralAnalysis:
         tfr_mne = mne.time_frequency.tfr_multitaper(
             raw, 
             freqs=self.frequencies, 
-            n_cycles=self.frequencies / 2, 
+            n_cycles=self.frequencies*2, 
             time_bandwidth=3, 
             return_itc=False,
             average=False,
@@ -802,21 +1197,26 @@ class PowerSpectralAnalysis:
         return TimeFrequencyRepresentation(tfr_data, tfr_times, tfr_freqs)        
 
     def _select_channels_and_adjust_data(self, epoch, select_channels):
-        
-        if select_channels is not None:
-            if isinstance(select_channels[0], str):
-                ch_names = select_channels
-                channel_indices = [self.channel_names.index(name) for name in ch_names]
-                epoch = epoch[:, channel_indices]
-            elif isinstance(select_channels[0], int):
-                ch_names = [self.channel_names[i] for i in select_channels]
-                epoch = epoch[:, select_channels]
-            ch_types=['eeg'] * len(select_channels)     
-        else:
-            ch_names = self.channel_names
-            ch_types = None
+        return select_channels_and_adjust_data(
+            epoch,
+            select_channels,
+            self.channel_names,
+            self.channel_groups
+        ) 
+        # if select_channels is not None:
+        #     if isinstance(select_channels[0], str):
+        #         ch_names = select_channels
+        #         channel_indices = [self.channel_names.index(name) for name in ch_names]
+        #         epoch = epoch[:, channel_indices]
+        #     elif isinstance(select_channels[0], int):
+        #         ch_names = [self.channel_names[i] for i in select_channels]
+        #         epoch = epoch[:, select_channels]
+        #     ch_types=['eeg'] * len(select_channels)     
+        # else:
+        #     ch_names = self.channel_names
+        #     ch_types = None
 
-        return ch_names, ch_types, epoch
+        # return ch_names, ch_types, epoch
     
     def postprocess_anatomical_region_average(self, attr_name=None):
         """
@@ -837,7 +1237,7 @@ class PowerSpectralAnalysis:
         channel_groups = self.channel_groups
 
         def calculate_region_average(tfr, region_name):
-            return tfr.calculate_anatomical_group_average(region_name, self.channel_names, channel_groups)
+            return tfr.calculate_anatomical_group_average(region_name, self.select_channel_names, channel_groups)
 
         self.region_average_tfr = {
             region: {
@@ -878,6 +1278,9 @@ class PowerSpectralAnalysis:
                 for epoch_name, tfr in tfr_dict.items()
             }
 
+        self.averaging_win_size = window_size
+        self.averaging_step_size = step_size
+
     def postprocess_aperiodic_paramaters(self, freq_range=None, aperiodic_mode='fixed', attr_name=None):
         """
         Calculate FOOOF aperiodic parameters.
@@ -913,7 +1316,7 @@ class PowerSpectralAnalysis:
                 for epoch_name, tfr in tfr_dict.items()
             }
 
-    def postprocess_periodic_parameters(self, freq_range=None, bands=None, aperiodic_mode='knee', peak_threshold=1.5, overlap_threshold=0.25, attr_name=None):
+    def postprocess_periodic_parameters(self, freq_range=None, fbands=None, aperiodic_mode='knee', peak_threshold=1.5, overlap_threshold=0.25, attr_name=None):
         """
         Calculate FOOOF periodic parameters.
         """
@@ -921,9 +1324,10 @@ class PowerSpectralAnalysis:
         if freq_range is None:
             freq_range = [0.5, self.frequencies[-1]]
 
-        if bands is None:
-            bands = {
+        if fbands is None:
+            fbands = {
                 'delta': [0.5, 4],
+                'theta': [4, 7],
                 'alpha':[7, 14],
                 'beta': [18, 35],
                 'gamma':[40, 55]
@@ -938,93 +1342,272 @@ class PowerSpectralAnalysis:
         is_region_average = next(iter(tfr_dict)) in self.channel_groups
 
         def calculate_params(tfr):
-            periodic_params, fooof_models = tfr.calculate_periodic_parameters(
-                freq_range=freq_range, bands=bands, aperiodic_mode=aperiodic_mode, peak_threshold=peak_threshold, overlap_threshold=overlap_threshold
+            return tfr.calculate_periodic_parameters(
+                tfr_data = tfr.data,
+                freq_range=freq_range, 
+                fbands=fbands, 
+                aperiodic_mode=aperiodic_mode, 
+                peak_threshold=peak_threshold, 
+                overlap_threshold=overlap_threshold
             )
-            return periodic_params, fooof_models
-
-        fooof_periodic_parameters = {}
-        fooof_models = {}
 
         if is_region_average:
             for region, region_tfr in tfr_dict.items():
                 region_params = {}
                 region_models = {}
+                aperiodic_fit = {}
+                aperiodic_fit_slope = {}
                 for epoch_name, tfr in region_tfr.items():
-                    region_params[epoch_name], region_models[epoch_name] = calculate_params(tfr)
-                fooof_periodic_parameters[region] = region_params
-                if region_models: # store if only models are returned
-                    fooof_models[region] = region_models
+                    region_params[epoch_name], region_models[epoch_name], aperiodic_fit[epoch_name], aperiodic_fit_slope[epoch_name] = calculate_params(tfr)
+                self.fooof_periodic_parameters[region] = region_params
+                self.fooof_aperiodic_fit[region] = aperiodic_fit
+                self.fooof_aperiodic_fit_slope[region] = aperiodic_fit_slope
+                if region_models:  # store if only models are returned
+                    self.fooof_model[region] = region_models
         else:
-            for epoch_name, tfr in tfr_dict.itmes():
-                fooof_periodic_parameters[epoch_name], fooof_models = calculate_params(tfr)
-                if fooof_models:
-                    fooof_models[epoch_name] = fooof_models
-        
-        self.fooof_periodic_parameters = fooof_periodic_parameters
-        self.fooof_models = fooof_models
+            for epoch_name, tfr in tfr_dict.items():
+                self.fooof_periodic_parameters[epoch_name], epoch_fooof_models, self.fooof_aperiodic_fit[epoch_name], self.fooof_aperiodic_fit_slope[epoch_name] = calculate_params(tfr)
+                if epoch_fooof_models:
+                    self.fooof_model[epoch_name] = epoch_fooof_models
 
-    def postprocess_frequency_domain_whitening(self, baseline_epoch_name=None, use_concatenated_baseline=False, attr_name=None):
+    def postprocess_frequency_domain_whitening(self, baseline_epoch_name=None, use_concatenated_baseline=False, per_channel=False, window_size=300, step_size=60, fbands = None, freq_range=None, fooof_aperidoc_freq_start=None, peak_threshold=0.1, attr_name='tfr'):
         """
         Apply frequency domain whitening on the calculated TFR data.
-        This method calcualtes the whitened TFRs by calling the 'calculate_whitened_tfr' method of the TFR objects,
-        which should be instances of the TimeFrequencyRepresentation class. 
-
+        
         Parameters: 
-        - baseline_epoch_name: Optional; name of the epoch to use as a baseline. If None, and
-          use_concatenated_baseline is False, each epoch is whitened based on its own data.
+        - baseline_epoch_name: Optional; name of the epoch to use as a baseline. If None and
+        use_concatenated_baseline is False, each epoch is whitened based on its own data.
         - use_concatenated_baseline: Optional; Boolean flag to indicate whether to use 
-          concatenated data from all epochs as a baseline. If baseline_epoch_name is provided,
-          this flag is ignored.
+        concatenated data from all epochs as a baseline. If baseline_epoch_name is provided,
+        this flag is ignored.
+        - per_channel: if False the whitening parameters are calculated from the avereage of data from all channels, otherwise calculated for each individual channel
+        Regardless, the aperiodic component is applied to individual channels for calculation of whitened TFRs  
+        - attr_name: the tfr type (tfr, region_average) that the whitening is applied on
         """
-        attr_name = attr_name or 'tfr'
+        
+        def calculate_baseline_data(tfr_dict, is_region_avg):
+            if baseline_epoch_name:
+                return {region: tfr_dict[region][baseline_epoch_name].data for region in tfr_dict} if is_region_avg else tfr_dict[baseline_epoch_name].data
+            if use_concatenated_baseline:
+                if is_region_avg:
+                    return {region: np.concatenate([tfr.data for tfr in region_tfr.values()], axis=1) for region, region_tfr in tfr_dict.items()}
+                return np.concatenate([tfr.data for tfr in tfr_dict.values()], axis=1)
+            return None
+        
+        def calculate_whitening_parameters(tfr, baseline_data, per_channel, exclude_fbands=True, peak_threshold=0.1, fbands=None, freq_range=None, fooof_aperidoc_freq_start=None, window_size=None, step_size=None, region=None, epoch_name=None):
+            
+            # TODO: If the periodic parameters have been previously calculated and are suitable for this purpose, avoid recalculating them here. 
+            # In such cases, this method should accept the periodic parameters as input.
+            
+            if baseline_data is not None:
+                baseline_tfr = TimeFrequencyRepresentation(
+                    data=baseline_data, times=tfr.times, frequencies=tfr.frequencies
+                )
+                
+                baseline_tfr.calculate_whitening_parameters(
+                    baseline_data=baseline_data, 
+                    per_channel=per_channel, 
+                    exclude_fbands=exclude_fbands, 
+                    peak_threshold=peak_threshold, 
+                    fbands=fbands,
+                    freq_range=freq_range,
+                    fooof_aperidoc_freq_start=fooof_aperidoc_freq_start
+                )
+                return baseline_tfr
+            
+            tfr.calculate_whitening_parameters(
+                per_channel=per_channel, 
+                exclude_fbands=exclude_fbands, 
+                peak_threshold=peak_threshold, 
+                window_size=window_size, 
+                step_size=step_size, 
+                fbands=fbands,
+                freq_range=freq_range,
+                fooof_aperidoc_freq_start=fooof_aperidoc_freq_start
+            )
+            return tfr 
 
+        attr_name = attr_name or 'tfr'
         tfr_dict = getattr(self, attr_name, None)
+
+        if fbands is None:
+            fbands = {
+                'delta': [0.5, 4],
+                'theta': [4, 7],
+                'alpha':[7, 14],
+                'beta': [18, 35],
+                'gamma':[35, 55]
+            }
+
+        if self.averaging_win_size is None: # if this has not been set somewheere else, then set it using the argument passed to this method
+            self.averaging_win_size = window_size
+
+        if self.averaging_step_size is None: # the same as averaging_win_size
+            self.averaging_step_size = step_size
+        
         if tfr_dict is None:
             raise ValueError(f"The attribute {attr_name} has not been calculated or does not exist")
-
-        is_region_average = next(iter(tfr_dict)) in self.channel_groups
-
+        
         if self.time_domain_whitened:
             warnings.warn("Time domain whitening has already been applied.", UserWarning)
+        
+        is_region_avg = next(iter(tfr_dict)) in self.channel_groups
+        baseline_data = calculate_baseline_data(tfr_dict, is_region_avg)
+        
+        if is_region_avg:
+            for region, region_tfr in tfr_dict.items():
+                
+                self.whitened_tfr[region] = {}
+                self.regression_ap_fit[region] = {}
+                self.regresssion_ap_fit_slope[region] = {}
+                self.regression_ap_fit_intercept[region] = {}
+                self.regression_ap_fit_included_freqs[region] = {}
+                self.fband_power_relative_reg_ap[region] = {}
+                self.fooof_periodic_parameters[region] = {}
+                self.fooof_model[region] = {}
+                self.fooof_aperiodic_fit[region] = {}
+                self.fooof_aperiodic_fit_slope[region] = {}
 
-        baseline_data = None
-        if baseline_epoch_name:
-            if is_region_average:
-                baseline_data = {region: tfr_dict[region][baseline_epoch_name].data for region in tfr_dict}
-            else:
-                baseline_data = tfr_dict[baseline_epoch_name].data
-        elif use_concatenated_baseline:
-            # Concatenate data from all epochs to create a baseline for whitening
-            if is_region_average:
-                concatenated_data = {
-                    region: np.concatenate([tfr.data for tfr in region_tfr.values()], axis=1) for region, region_tfr in tfr_dict.items()
-                }
-                baseline_data = concatenated_data
-            else:
-                concatenated_data = [tfr.data for tfr in tfr_dict.values()]
-                baseline_data = np.concatenate(concatenated_data, axis=1)
+                    
+                for epoch_name, tfr in region_tfr.items():
+                    tfr_with_whitening_params = calculate_whitening_parameters(
+                        tfr, 
+                        baseline_data.get(region) if baseline_data is not None else None, 
+                        per_channel=per_channel, 
+                        exclude_fbands=True, 
+                        peak_threshold=peak_threshold, 
+                        fbands=fbands,
+                        freq_range=freq_range, 
+                        fooof_aperidoc_freq_start=fooof_aperidoc_freq_start,
+                        window_size=self.averaging_win_size, 
+                        step_size=self.averaging_step_size, 
+                        # region=region, 
+                        # epoch_name=epoch_name,
+                    )
 
-        if is_region_average:
-            self.whitened_tfr = {
-                region: {
-                    epoch_name: tfr.calculate_whitened_tfr(baseline_data[region] if baseline_data else None)
-                    for epoch_name, tfr in region_tfr.items()
-                }
-                for region, region_tfr in tfr_dict.items()
-            }
+                    # Store the aperiodic whitening parameters
+                    reg_ap_fit = tfr_with_whitening_params.reg_fit_aperiodic_fit
+                    fooof_periodic_params = tfr_with_whitening_params.fooof_periodic_params
+                    if baseline_data is None:
+                        self.regression_ap_fit[region][epoch_name] = reg_ap_fit
+                        self.regresssion_ap_fit_slope[region][epoch_name] = tfr_with_whitening_params.reg_fit_slope
+                        self.regression_ap_fit_intercept[region][epoch_name] = tfr_with_whitening_params.reg_fit_intercept
+                        self.regression_ap_fit_included_freqs[region][epoch_name] = tfr_with_whitening_params.reg_fit_included_freqs
+                        
+                        self.fooof_periodic_parameters[region][epoch_name] = fooof_periodic_params
+                        self.fooof_model[region][epoch_name] = tfr_with_whitening_params.fooof_model
+                        self.fooof_aperiodic_fit[region][epoch_name] = tfr_with_whitening_params.fooof_aperiodic_fit
+                        self.fooof_aperiodic_fit_slope[region][epoch_name] = tfr_with_whitening_params.fooof_aperiodic_fit_slope
+                    
+                    else: # if baseline is used
+                        pass
+                        #TODO: window the data based on the win_size and win_step_size that are passed to the method
+                        #TODO: calculate FOOOF periodic parameters for no baseline condition. 
+
+                    # Use the calculated aperiodic component to whiten the spectrum and calculate relative power in frequency bands detected using FOOOF
+                    whitened_tfr = tfr.calculate_whitened_tfr(
+                        reg_ap_fit, self.averaging_win_size, self.averaging_step_size, per_channel
+                    )
+                    self.whitened_tfr[region][epoch_name] = whitened_tfr
+
+
+                    # Calculate the relative power for each frequency band. The boudnaries of each frequency band is calcualted using FOOOF
+                    # NOTE: the boundaries of each frequency band might have been extracted from the baseline or the current epoch, and used for the calculation of the power in corresponding band. 
+                    window_average_whitened_tfr_data, _, _ = whitened_tfr.calculate_window_average(
+                        window_size=self.averaging_win_size, step_size= self.averaging_step_size
+                    )
+                    
+                    tfr_freqs = whitened_tfr.frequencies
+
+                    self.fband_power_relative_reg_ap[region][epoch_name] = {}
+                    num_channels, num_time_points = fooof_periodic_params['alpha']['lower_bound'].shape
+                    for fband_label, fband_bound in fbands.items():
+                        self.fband_power_relative_reg_ap[region][epoch_name][fband_label] = np.full((num_channels, num_time_points), np.nan)
+                        for chan_idx in range(num_channels):
+                            for time_pt in range(num_time_points):
+                                if fband_label != 'delta':
+                                        lower_bound = fooof_periodic_params[fband_label]['lower_bound'][chan_idx, time_pt]
+                                        upper_bound = fooof_periodic_params[fband_label]['upper_bound'][chan_idx, time_pt]
+                                else:
+                                    lower_bound, upper_bound = fband_bound
+
+                                if lower_bound is not None and upper_bound is not None:
+                                    band_mask = (tfr_freqs >= lower_bound) & (tfr_freqs <= upper_bound)
+                                    power_relative = np.mean(window_average_whitened_tfr_data[band_mask, time_pt, chan_idx]) if band_mask.any() else np.nan
+                                    self.fband_power_relative_reg_ap[region][epoch_name][fband_label][chan_idx, time_pt] = power_relative
+
         else:
-            self.whitened_tfr = {
-                epoch_name: tfr.calculate_whitened_tfr(baseline_data)
-                for epoch_name, tfr in tfr_dict.items()
-            }
+            for epoch_name, tfr in tfr_dict.items():
+                tfr_with_whitening_params = calculate_whitening_parameters(
+                    tfr, 
+                    baseline_data, 
+                    per_channel=per_channel,
+                    exclude_fbands=True,
+                    peak_threshold=peak_threshold,
+                    fbands=fbands,
+                    freq_range=freq_range,
+                    fooof_aperidoc_freq_start = fooof_aperidoc_freq_start,
+                    window_size=self.averaging_win_size,
+                    step_size=self.averaging_step_size,
+                    # region=region, 
+                    # epoch_name=epoch_name,
+                )
 
+                # Store the aperiodic whitening parameters
+                reg_ap_fit = tfr_with_whitening_params.reg_fit_aperiodic_fit
+                if baseline_data is None:
+                    self.regression_ap_fit[epoch_name] = reg_ap_fit
+                    self.regresssion_ap_fit_slope[epoch_name] = tfr_with_whitening_params.reg_fit_slope
+                    self.regression_ap_fit_intercept[epoch_name] = tfr_with_whitening_params.reg_fit_intercept
+                    self.regression_ap_fit_included_freqs[epoch_name] = tfr_with_whitening_params.reg_fit_included_freqs
+                    
+                    self.fooof_periodic_parameters[epoch_name] = tfr_with_whitening_params.fooof_periodic_params
+                    self.fooof_model[epoch_name] = tfr_with_whitening_params.fooof_model
+                    self.fooof_aperiodic_fit[epoch_name] = tfr_with_whitening_params.fooof_aperiodic_fit
+                    self.fooof_aperiodic_fit_slope[epoch_name] = tfr_with_whitening_params.fooof_aperiodic_fit_slope
+
+                else: # if baseline is used
+                    pass
+                    #TODO: window the data based on the win_size and win_step_size that are passed to the method
+                    #TODO: calculate FOOOF periodic parameters for no baseline condition. 
+
+                # Use the calculated aperiodic component to whiten the spectrum and calculate relative power in specific frequency bands
+                whitened_tfr = tfr.calculate_whitened_tfr(
+                    reg_ap_fit, self.averaging_win_size, self.averaging_step_size, per_channel
+                )
+                self.whitened_tfr[epoch_name] = whitened_tfr
+
+                window_average_whitened_tfr_data, _, _ = whitened_tfr.calculate_window_average(
+                    window_size=self.averaging_win_size, step_size= self.averaging_step_size
+                )
+                    
+                tfr_freqs = whitened_tfr.frequencies
+
+                self.fband_power_relative_reg_ap[epoch_name] = {}
+                num_channels, num_time_points = fooof_periodic_params['alpha']['lower_bound'].shape
+                for fband_label, fband_bound in fbands.items():
+                    self.fband_power_relative_reg_ap[epoch_name][fband_label] = np.full((num_channels, num_time_points), np.nan)
+                    for chan_idx in range(num_channels):
+                        for time_pt in range(num_time_points):
+                            if fband_label != 'delta':
+                                    lower_bound = fooof_periodic_params[fband_label]['lower_bound'][chan_idx, time_pt]
+                                    upper_bound = fooof_periodic_params[fband_label]['upper_bound'][chan_idx, time_pt]
+                            else:
+                                lower_bound, upper_bound = fband_bound
+
+                            if lower_bound is not None and upper_bound is not None:
+                                band_mask = (tfr_freqs >= lower_bound) & (tfr_freqs <= upper_bound)
+                                power_relative = np.mean(window_average_whitened_tfr_data[band_mask, time_pt, chan_idx]) if band_mask.any() else np.nan
+                                self.fband_power_relative_reg_ap[epoch_name][fband_label][chan_idx, time_pt] = power_relative
+
+                
     def calculate_emergence_trajectory(self):
         """
         Calculate power for each frequency band.
         """
         # Placeholder for actual spectral parameter calculation logic
         self.emergence_trajectory = {}  # Replace with actual spectral parameter calculation
+
 
 
 

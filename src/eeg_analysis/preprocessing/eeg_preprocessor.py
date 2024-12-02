@@ -2,7 +2,8 @@ import numpy as np
 import scipy.signal as signal
 import mne
 from mne.preprocessing import ICA
-from src.eeg_analysis.utils.helpers import create_mne_raw_from_data 
+from src.eeg_analysis.utils.helpers import create_mne_raw_from_data
+from src.eeg_analysis.utils.helpers import calculate_z_score_eeg
 
 class EEGPreprocessor:
     def __init__(self, eeg_file):
@@ -246,10 +247,10 @@ class EEGPreprocessor:
         if window_size is None:
             window_size = 2.0
 
-        z_scored_eeg = self.calculate_z_score(eeg_data) # or can be called EEGPreprocessor.calculate_z_score 
+        z_scored_eeg = self.calculate_z_score(eeg_data, self.sampling_frequency) # or can be called EEGPreprocessor.calculate_z_score 
         
-        segmented_eeg = self.get_segments(eeg_data, sampling_frequency, window_size=window_size)
-        segmented_z_scored_eeg = self.get_segments(z_scored_eeg, sampling_frequency, window_size=window_size)
+        segmented_eeg, _ = self.get_segments(eeg_data, sampling_frequency, window_size=window_size)
+        segmented_z_scored_eeg, _ = self.get_segments(z_scored_eeg, sampling_frequency, window_size=window_size)
 
         exclude_indices = self._mark_exclude_segments(segmented_z_scored_eeg, threshold=threshold, min_num_channels=min_num_channels)
 
@@ -279,7 +280,7 @@ class EEGPreprocessor:
         return self.eeg_with_rejected_noisy_segments
     
     @staticmethod
-    def calculate_z_score(data):
+    def calculate_z_score(data, sampling_frequency):
         """
         Calculate the z-score normalized version of the provided EEG data. Z-scoring is 
         performed channel-wise. This static method supports continuous data, epoched data, 
@@ -296,6 +297,11 @@ class EEGPreprocessor:
                             Each channel within the epochs or segments will be independently normalized.
         """
         def calculate_z_score_epoch(epoch):
+            # return calculate_z_score_eeg(
+            #     epoch,
+            #     duration=120,
+            #     sampling_rate=sampling_frequency,
+            #     peak_threshold=8)
             z_scored_epoch = np.zeros_like(epoch)
             for channel in range(epoch.shape[1]):
                 channel_eeg = epoch[:, channel]
@@ -330,45 +336,63 @@ class EEGPreprocessor:
         return z_scored_eeg
 
     @staticmethod
-    def get_segments(data, sampling_frequency, window_size: float):
+    def get_segments(data, sampling_frequency, window_size: float, overlap: float = None):
         """
-        Divide EEG data (either continuous or epoched) into segments
+        Divide EEG data (either continuous or epoched) into (overlapping) segments and return window centers.
 
         Parameters:
         data: can be continuous or epoched data
-        sampling_frequency (float): sampling frequnecy of EEG data
-        length (float): The length of each segment/window in seconds
+        sampling_frequency (float): sampling frequency of EEG data
+        window_size (float): The length of each segment/window in seconds
+        overlap (float): The percentage overlap between consecutive segments (0 <= overlap < 1)
+        
+        Returns:
+        segmented_eeg: Segmented EEG data, either in a dictionary if input is a dictionary or a numpy array otherwise
+        window_centers: List of window center indices in seconds
         """
+        if overlap is None:
+            overlap = 0.0
+
+        if not (0 <= overlap < 1):
+            raise ValueError("Overlap must be between 0 (inclusive) and 1 (non-inclusive)")
 
         segment_length_samples = int(window_size * sampling_frequency)
+        step_size_samples = int(segment_length_samples * (1 - overlap))
 
-        def get_segments_epoch(epoch, segment_length_samples):
-
+        def get_segments_epoch(epoch, segment_length_samples, step_size_samples):
             epoch_length_samples = epoch.shape[0]
-        
+            
             # If the epoch length is smaller than the segment length, handle it by creating a single segment
             if epoch_length_samples < segment_length_samples:
                 segments = np.zeros((segment_length_samples, epoch.shape[1], 1))
                 segments[:epoch_length_samples, :, 0] = epoch
-                return segments
+                window_centers = [epoch_length_samples / 2 / sampling_frequency]
+                return segments, window_centers
 
             # Calculate the number of segments for longer data
-            num_segments = epoch.shape[0] // segment_length_samples
+            num_segments = (epoch_length_samples - segment_length_samples) // step_size_samples + 1
             segments = np.zeros((segment_length_samples, epoch.shape[1], num_segments))
+            window_centers = []
 
             for i in range(num_segments):
-                start_index = i * segment_length_samples
+                start_index = i * step_size_samples
                 end_index = start_index + segment_length_samples
-                segments[:, :, i] = epoch[start_index:end_index, :] 
-            return segments
+                segments[:, :, i] = epoch[start_index:end_index, :]
+                window_centers.append((start_index + end_index) / 2 / sampling_frequency)
+
+            return segments, window_centers
 
         if isinstance(data, dict):
-            segmented_eeg = {epoch_name: get_segments_epoch(epoch_data, segment_length_samples)
-                                  for epoch_name, epoch_data in data.items()}
+            segmented_eeg = {}
+            window_centers = {}
+            for epoch_name, epoch_data in data.items():
+                segments, centers = get_segments_epoch(epoch_data, segment_length_samples, step_size_samples)
+                segmented_eeg[epoch_name] = segments
+                window_centers[epoch_name] = centers
         else:
-            segmented_eeg = get_segments_epoch(data, segment_length_samples)
-        
-        return segmented_eeg 
+            segmented_eeg, window_centers = get_segments_epoch(data, segment_length_samples, step_size_samples)
+
+        return segmented_eeg, window_centers
     
     @staticmethod
     def _mark_exclude_segments(segmented_eeg, threshold: float = 2.0, min_num_channels: int = 4):
@@ -457,7 +481,7 @@ class EEGPreprocessor:
             else:
                 raise ValueError("Unsupported operation: {}".format(op_name))
             
-    def convert_to_neuroscope_eeg(eeg_data, eeg_path, sampling_rate):
+    def convert_to_neuroscope_eeg(eeg_data, sampling_rate, eeg_path, suffix):
         
         def convert_to_int(eeg_data):
             num_channels = eeg_data.shape[1]
@@ -504,14 +528,14 @@ class EEGPreprocessor:
                 file.write(eeg_data.tobytes())
 
         import os
-        def generate_new_file_path(eeg_path):
+        def generate_new_file_path(eeg_path, suffix):
             base_name, extension = os.path.splitext(eeg_path)
-            new_base_name = base_name + "_2"
+            new_base_name = base_name + suffix
             new_file_path = new_base_name + extension
             return new_file_path
 
         # Paths
-        output_eeg_path = generate_new_file_path(eeg_path)
+        output_eeg_path = generate_new_file_path(eeg_path, suffix)
         
         eeg_data_int = convert_to_int(eeg_data)
         eeg_data_int_transposed = eeg_data_int

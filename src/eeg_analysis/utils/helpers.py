@@ -63,7 +63,34 @@ def get_eeg_channel_indices(ch_names, channel_groups):
 
     return eeg_channel_indices, eeg_channel_names
 
-def calculate_z_score_eeg(eeg, duration=120, sampling_rate=250, peak_threshold=8):
+def select_channels_and_adjust_data(epoch, select_channels, ch_names, ch_groups):
+    if select_channels is not None:
+        if isinstance(select_channels[0], str):
+            select_channel_names = select_channels
+            channel_indices = [ch_names.index(name) for name in select_channel_names]
+            epoch = epoch[:, channel_indices]
+        elif isinstance(select_channels[0], int):
+            select_channel_names = [ch_names[i] for i in select_channels]
+            epoch = epoch[:, select_channels]
+        # select_channel_types = ['eeg'] * len(select_channels)     
+    else:
+        all_eeg_channels = []
+        for group, channels in ch_groups.items():
+            if group in ['prefrontal', 'frontal', 'central', 'temporal', 'parietal', 'occipital']:
+                all_eeg_channels.extend(channels)
+        channel_indices = [ch_names.index(name) for name in all_eeg_channels]
+        epoch = epoch[:, channel_indices]
+        select_channel_names = all_eeg_channels
+    
+    select_channel_types = ['eeg'] * len(select_channel_names)
+
+        # select_channel_names = ch_names
+        # select_channel_types = None
+
+    return select_channel_names, select_channel_types, epoch
+
+
+def calculate_z_score_eeg(eeg, duration=None, sampling_rate=250, peak_threshold=8):
     """
     Calculates the z-score in consecutive bouts of EEG data with specified duration and concatenates them together.
     Removes data with peak z_score above the specified threshold by embedding them with zero before recalculating z_score.
@@ -77,6 +104,9 @@ def calculate_z_score_eeg(eeg, duration=120, sampling_rate=250, peak_threshold=8
     Returns:
         numpy array: Z-scored EEG data concatenated across all segments
     """
+    if duration is None:
+        duration = int(eeg.shape[0]/sampling_rate)
+
     n_samples = eeg.shape[0]
     n_channels = eeg.shape[1]
 
@@ -129,19 +159,72 @@ def calculate_z_score_eeg(eeg, duration=120, sampling_rate=250, peak_threshold=8
 
     return z_scored_epoch
 
-def remove_outliers(data):
+def remove_outliers(data, factor=1.5):
     """
     Remove outliers from a dataset using the interquartile range (IQR) method.
     """
     
     data = np.array(data)
+    # data = data[~np.isnan(data)]
 
-    q1, q3 = np.percentile(data, [25, 75])
+    q1, q3 = np.nanpercentile(data, [25, 75])
     iqr = q3 - q1
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
+    lower_bound = q1 - factor * iqr
+    upper_bound = q3 + factor * iqr
     mask = (data >= lower_bound) & (data <= upper_bound)
     filtered_data = data[mask]
     # indices = np.where(mask)[0]  # Get the indices of accepted data samples
     
     return filtered_data, mask
+
+def bottom_left_off_diagonal(array):
+    """Extracts off-diagonal elements from the bottom-left rectangle of a matrix."""
+
+    rows, cols = array.shape
+    result = []
+
+    for i in range(1, rows):
+        for j in range(0, i):
+            result.append(array[i, j])
+    return np.array(result)
+
+def detect_and_interpolate_outliers(time_series, iqr_factor=1.5):
+    """
+    Detects outliers in a time series using the IQR method and interpolates them using linear interpolation.
+    
+    Parameters:
+    time_series (np.ndarray): The input time series data.
+    
+    Returns:
+    np.ndarray: The time series with outliers interpolated.
+    """
+    if not isinstance(time_series, np.ndarray):
+        raise ValueError("Input time series must be a numpy array")
+    if time_series.ndim != 1:
+        raise ValueError("Input time series must be one-dimensional")
+    
+    clean_series = time_series.astype(float)
+
+    if len(time_series) >= 3:
+        # Calculate the first quartile (Q1) and third quartile (Q3)
+        Q1 = np.percentile(time_series, 25)
+        Q3 = np.percentile(time_series, 75)
+        
+        # Calculate the Interquartile Range (IQR)
+        IQR = Q3 - Q1
+        
+        # Determine the outlier boundaries
+        lower_boundary = Q1 - iqr_factor * IQR
+        upper_boundary = Q3 + iqr_factor * IQR
+        
+        # Identify outliers
+        outliers = (time_series < lower_boundary) | (time_series > upper_boundary)
+        
+        # Set outliers to NaN for interpolation
+        clean_series[outliers] = np.nan
+        
+        # Perform linear interpolation
+        nans, x = np.isnan(clean_series), lambda z: z.nonzero()[0]
+        clean_series[nans] = np.interp(x(nans), x(~nans), clean_series[~nans])
+        
+    return clean_series

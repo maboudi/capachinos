@@ -25,6 +25,10 @@ def set_custom_style():
         'legend.title_fontsize': 5,
         'legend.frameon': False,
         'legend.markerscale': 0.5,
-        'xtick.major.size': 0.5,
-        'ytick.major.size': 0.5
+        'xtick.major.size': 1,
+        'ytick.major.size': 1,
+        'xtick.major.width': 0.5,
+        'ytick.major.width': 0.5,
+        'xtick.major.pad': 1,
+        'ytick.major.pad': 1,
     })

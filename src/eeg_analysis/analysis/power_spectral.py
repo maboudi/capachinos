@@ -53,7 +53,7 @@ class TimeFrequencyRepresentation:
         self.fooof_aperiodic_fit = None 
         self.fooof_aperiodic_fit_slope = None
 
-    def plot(self, ax=None, channel=None, start_time=0, vmin=None, vmax=None, cmap='viridis', colorbar=False, add_lables=False, title='Time-Frequency Representation'):
+    def plot(self, ax=None, channel=None, start_time=0, db = True, vmin=None, vmax=None, cmap='viridis', colorbar=False, add_lables=False, title='Time-Frequency Representation'):
         
         if channel is not None:
             data_to_plot = self.data[:,:, channel]
@@ -70,9 +70,11 @@ class TimeFrequencyRepresentation:
         
         adjusted_times = self.times + start_time
 
-        Sxx_db = 10 * np.log10(np.abs(data_to_plot))
+        if db == True:
+            data_to_plot = 10 * np.log10(np.abs(data_to_plot))
 
-        im = ax.imshow(Sxx_db, aspect='auto', 
+
+        im = ax.imshow(data_to_plot, aspect='auto', 
                        extent=[adjusted_times.min(), adjusted_times.max(), self.frequencies.min(), self.frequencies.max()], 
                        origin='lower', vmin=vmin, vmax=vmax, cmap=cmap, interpolation='nearest')
         if colorbar:

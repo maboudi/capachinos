@@ -1,5 +1,7 @@
 import mne
 import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
 
 def create_mne_raw_from_data(data, channel_names, sampling_frequency, eeg_channel_count=16, ch_types=None):
@@ -190,13 +192,14 @@ def bottom_left_off_diagonal(array):
 
 def detect_and_interpolate_outliers(time_series, iqr_factor=1.5):
     """
-    Detects outliers in a time series using the IQR method and interpolates them using linear interpolation.
-    
+    Detects outliers in a time series using the IQR method and interpolates them using linear interpolation,
+    while preserving the original NaN values.
+
     Parameters:
     time_series (np.ndarray): The input time series data.
     
     Returns:
-    np.ndarray: The time series with outliers interpolated.
+    np.ndarray: The time series with outliers interpolated, preserving original NaNs.
     """
     if not isinstance(time_series, np.ndarray):
         raise ValueError("Input time series must be a numpy array")
@@ -204,6 +207,9 @@ def detect_and_interpolate_outliers(time_series, iqr_factor=1.5):
         raise ValueError("Input time series must be one-dimensional")
     
     clean_series = time_series.astype(float)
+
+    # Store the indices of the original NaN values
+    original_nans = np.isnan(clean_series)
 
     if len(time_series) >= 3:
         # Calculate the first quartile (Q1) and third quartile (Q3)
@@ -227,4 +233,63 @@ def detect_and_interpolate_outliers(time_series, iqr_factor=1.5):
         nans, x = np.isnan(clean_series), lambda z: z.nonzero()[0]
         clean_series[nans] = np.interp(x(nans), x(~nans), clean_series[~nans])
         
+        # Restore original NaNs
+        clean_series[original_nans] = np.nan
+        
     return clean_series
+
+def detect_and_interpolate_outliers_v2(time_series, window_size=3, std_factor=3):
+    """
+    Detects outliers in a time series using a rolling window-based adaptive method
+    and interpolates them using linear interpolation, while preserving the original NaN values.
+
+    Parameters:
+    time_series (np.ndarray): The input time series data.
+    window_size (int): The size of the rolling window for calculating local statistics.
+    std_factor (float): The number of standard deviations to use for detecting outliers.
+
+    Returns:
+    np.ndarray: The time series with outliers interpolated, preserving original NaNs.
+    """
+    if not isinstance(time_series, np.ndarray):
+        raise ValueError("Input time series must be a numpy array")
+    if time_series.ndim != 1:
+        raise ValueError("Input time series must be one-dimensional")
+
+    clean_series = time_series.astype(float)
+
+    # Store the indices of the original NaN values
+    original_nans = np.isnan(clean_series)
+
+    if len(time_series) >= window_size:
+        # Calculate rolling median and rolling standard deviation
+        rolling_median = pd.Series(clean_series).rolling(window=window_size, center=True).median()
+        rolling_std = pd.Series(clean_series).rolling(window=window_size, center=True).std()
+
+        # Fill initial and final missing rolling_median and rolling_std with the nearest valid value
+        rolling_median = rolling_median.bfill().ffill()
+        rolling_std = rolling_std.bfill().ffill()
+
+        # Identify outliers based on deviation from the rolling median
+        deviation = np.abs(clean_series - rolling_median)
+        outliers = deviation > std_factor * rolling_std
+
+        # Set outliers to NaN for interpolation
+        try:
+            clean_series[outliers] = np.nan
+
+            # Perform linear interpolation
+            nans, x = np.isnan(clean_series), lambda z: z.nonzero()[0]
+            if np.any(~nans):
+                f = interp1d(x(~nans & ~original_nans), clean_series[~nans & ~original_nans], kind='cubic', fill_value="extrapolate")
+                clean_series[nans & ~original_nans] = f(x(nans & ~original_nans))
+
+                # clean_series[nans] = np.interp(x(nans), x(nans), clean_series[nans])
+
+            # Restore original NaNs
+            clean_series = pd.Series(clean_series).rolling(window=3, center=True).mean().bfill().ffill()
+            clean_series[original_nans] = np.nan
+        except:
+            pass
+
+    return np.array(clean_series)

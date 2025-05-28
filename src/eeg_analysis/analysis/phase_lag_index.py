@@ -24,6 +24,7 @@ class PhaseLagIndex:
         self.fmax = None
         self.fmin_bb_avg = None
         self.fmax_bb_avg = None
+        self.mt_bandwidth = None
 
         self.conn_wpli = None
         self.conn_wpli_favg = None
@@ -45,6 +46,8 @@ class PhaseLagIndex:
             window_size = 300, 
             overlap_ratio = 0.5, 
             rep_seg_size = 10, 
+            rep_seg_overlap_ratio = 0,
+            mt_bandwidth = 2,
             pli_method='wpli2_debiased',
             fmin = 0.5,
             fmax = 55,
@@ -57,6 +60,8 @@ class PhaseLagIndex:
         self.window_size = window_size
         self.overlap_ratio = overlap_ratio
         self.rep_seg_size = rep_seg_size
+        self.rep_seg_overlap_ratio = rep_seg_overlap_ratio
+        self.mt_bandwidth = mt_bandwidth
         self.pli_method = pli_method
         self.fmin = fmin
         self.fmax = fmax
@@ -108,8 +113,6 @@ class PhaseLagIndex:
             self.win_centers = win_centers
             self.select_channel_names = chan_names
 
-
-
     def _calculate_epoch_pli(self, epoch_data, select_channels):
 
         chan_names, _, epoch_data = self._select_channels_and_adjust_data(epoch_data, select_channels)
@@ -152,6 +155,7 @@ class PhaseLagIndex:
         freq_bands_oi = self.frequency_bands_of_interest
         freq_bands_oi['bb'] = [self.fmin_bb_avg, self.fmax_bb_avg]
 
+
         if eeg_windows.ndim == 2: # if eeg data is not windowed meaning entire epoch
             eeg_windows = eeg_windows[:, :, np.newaxis]
 
@@ -187,12 +191,13 @@ class PhaseLagIndex:
             return np.any(z_scores > threshold)
 
         # Calculate the shape of one connectivity matrix to know dimensions for zero-padding
-        sample_window, _ = EEGPreprocessor.get_segments(eeg_windows[:, :, 0], self.sampling_frequency, self.rep_seg_size)
+        sample_window, _ = EEGPreprocessor.get_segments(eeg_windows[:, :, 0], self.sampling_frequency, self.rep_seg_size, self.rep_seg_overlap_ratio)
         sample_window = np.transpose(sample_window, (2, 1, 0))
         sample_conn = spectral_connectivity_epochs(
             sample_window,
             method=self.pli_method,
             mode='multitaper',
+            mt_bandwidth=self.mt_bandwidth,
             sfreq=self.sampling_frequency,
             fmin=self.fmin,
             fmax=self.fmax,
@@ -211,7 +216,7 @@ class PhaseLagIndex:
 
         num_windows = eeg_windows.shape[2]
 
-        for win_idx in range(num_windows): # [12]:
+        for win_idx in range(num_windows):
 
             if num_windows > 1:
                 print(f'window {win_idx + 1}', end='\r')
@@ -219,7 +224,7 @@ class PhaseLagIndex:
             window = eeg_windows[:, :, win_idx]
 
             # Dividing into smaller segments within each window for averaging 
-            segments, _ = EEGPreprocessor.get_segments(window, self.sampling_frequency, self.rep_seg_size)
+            segments, _ = EEGPreprocessor.get_segments(window, self.sampling_frequency, self.rep_seg_size, self.rep_seg_overlap_ratio)
             segments = np.transpose(segments, (2, 1, 0))  # Transpose to match shape (n_epochs, n_channels, n_times)
             
             if rm_outlier_segs:
@@ -244,6 +249,9 @@ class PhaseLagIndex:
                 print(f"All channels in window {win_idx} are zero-padded. Adding zero-padded matrix.")
                 zero_padded_conn = np.zeros(conn_shape)
                 conn_wpli_win.append(zero_padded_conn)
+                for band_name in freq_bands_oi.keys():
+                    faveraged_wpli_data = np.zeros((conn_shape[0], conn_shape[1]))
+                    conn_wpli_win_favg[band_name].append(faveraged_wpli_data)
                 continue
 
             # Calculate spectral connectivity for each segment
@@ -251,6 +259,7 @@ class PhaseLagIndex:
                 segments,
                 method=self.pli_method,
                 mode='multitaper',
+                mt_bandwidth=self.mt_bandwidth,
                 sfreq=self.sampling_frequency,
                 fmin=self.fmin,
                 fmax=self.fmax,

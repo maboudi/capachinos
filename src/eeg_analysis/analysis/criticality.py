@@ -398,7 +398,7 @@ class NeuronalAvalanche:
             self.segmented_eeg_flag = True
             self.segment_duration = segment_duration 
             # Divide the EEG signal into bins of fixed duration
-            self._segmented_eeg = EEGPreprocessor.get_segments(
+            self._segmented_eeg, self.win_centers = EEGPreprocessor.get_segments(
                 data=self.eeg_data, 
                 sampling_frequency=self.sampling_frequency,
                 window_size=self.segment_duration

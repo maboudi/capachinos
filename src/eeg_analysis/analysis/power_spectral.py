@@ -252,6 +252,7 @@ class TimeFrequencyRepresentation:
 
             included_freqs_idx = np.full((len(freqs), ), True)
             for fband, band_params in excluded_fbands.items():
+
                 lower_bound = 0 if fband == 'delta' else band_params['lower_bound'][curr_chan_idx, current_win_idx]
                 upper_bound = 4 if fband == 'delta' else band_params['upper_bound'][curr_chan_idx, current_win_idx]
 
@@ -389,9 +390,12 @@ class TimeFrequencyRepresentation:
                             self.fooof_periodic_params, freqs, freq_range=freq_range, current_win_idx=win_idx
                         )
                     
-                    self.reg_fit_slope[win_idx, 0], self.reg_fit_intercept[win_idx, 0] = np.polyfit(
-                        freqs[included_freqs_idx], psd_db[included_freqs_idx], 1
-                    )
+                    try:
+                        self.reg_fit_slope[win_idx, 0], self.reg_fit_intercept[win_idx, 0] = np.polyfit(
+                            freqs[included_freqs_idx], psd_db[included_freqs_idx], 1
+                        )
+                    except:
+                        print('Error in calculating the regression line parameters')
                     self.reg_fit_included_freqs[:, win_idx, 0] = included_freqs_idx
                     self.reg_fit_aperiodic_fit[:, win_idx, 0] = (
                         self.reg_fit_intercept[win_idx, 0] + self.reg_fit_slope[win_idx, 0] * freqs
@@ -558,6 +562,21 @@ class TimeFrequencyRepresentation:
         _, num_time_points, num_channels = tfr_data.shape
         tfr_freqs = self.frequencies
 
+        # Artificially complete the delta peak by extending to imaginary frequencies below the lowest frequency (can get negative values)
+        
+        max_freq = 8 # The maximum frequency for the delta band
+        idx_freq = np.argmin(np.abs(tfr_freqs - max_freq))
+        artificial_freqs = np.flip(tfr_freqs[0]-tfr_freqs[:idx_freq])
+        extended_freqs = np.concatenate((artificial_freqs, tfr_freqs))
+
+        # We need to make sure the frequencies are positive for the FOOOF model fitting
+        start_freq_diff = tfr_freqs[0] - extended_freqs[0]
+        extended_freqs = extended_freqs + start_freq_diff
+
+        artificial_tfr_data = np.flip(tfr_data[:idx_freq, :, :], axis=0)
+        extended_tfr_data = np.concatenate((artificial_tfr_data, tfr_data), axis=0)
+
+
         # Initialize a structure to store FOOOF models only if the conditions are met
         fooof_model = {}
         # if num_time_points <= 50 and num_channels == 1:
@@ -592,31 +611,40 @@ class TimeFrequencyRepresentation:
                     aperiodic_mode=aperiodic_mode, peak_threshold=peak_threshold, verbose=False
                 )
 
-                try:
-                    curr_fooof_model.fit(
-                        tfr_freqs, tfr_data[:, time_pt, chn_idx], freq_range=freq_range
-                    )
-
-                except:
-                    print(f'Error fitting FOOOF model')
+                curr_tfr = extended_tfr_data[:, time_pt, chn_idx]
+                if np.sum(curr_tfr) < 0.1:
                     continue
+                else:
+                    try:
+                        curr_fooof_model.fit(
+                            extended_freqs,
+                            # tfr_freqs, 
+                            curr_tfr, 
+                            freq_range=[extended_freqs[0], extended_freqs[-1]],
+                            # freq_range=freq_range
+                        )
 
-                if curr_fooof_model is not None:
-                    fooof_model[(chn_idx, time_pt)] = curr_fooof_model
-                
-                    # aperiodic_params = fooof_model.get_params('aperiodic_params')
-                    # aperiodic_fit = self._aperiodic_fit(tfr_freqs, aperiodic_params)
-                    # aperiodic_fit = fooof_model._ap_fit
-                    # try:
-                    curr_aperiodic_fit = gen_aperiodic(
-                        curr_fooof_model.freqs, curr_fooof_model._robust_ap_fit(curr_fooof_model.freqs, curr_fooof_model.power_spectrum)
-                    )
+                    except:
+                        print(f'Error fitting FOOOF model')
+                        continue
 
-                    # Loop over bands and store the peak parameters
-                    prev_upper_bound = np.nan
-                    prev_band_label = None
-                    for band_label, freq_band in fbands.items():
-                        if band_label != 'delta':
+                    if curr_fooof_model is not None:
+                    
+                        # aperiodic_params = fooof_model.get_params('aperiodic_params')
+                        # aperiodic_fit = self._aperiodic_fit(tfr_freqs, aperiodic_params)
+                        # aperiodic_fit = fooof_model._ap_fit
+
+                        try:
+                            peaks = curr_fooof_model.get_params('peak_params')
+                        except:
+                            continue
+                        peaks[:, 0] -= start_freq_diff
+                        
+                        # Loop over bands and store the peak parameters
+                        prev_upper_bound = np.nan
+                        prev_band_label = None
+                        for band_label, freq_band in fbands.items():
+                            # if band_label != 'delta':
                             if band_label in ['beta']:
                                 bandwidth_factor = 1/1.5
                             elif band_label in ['gamma']:
@@ -627,7 +655,7 @@ class TimeFrequencyRepresentation:
                                 bandwidth_factor = 1/4
 
                             extracted_peak = self._extract_highest_peak_in_band(
-                                curr_fooof_model, freq_band, bandwidth_factor, overlap_threshold=overlap_threshold
+                                peaks, freq_band, bandwidth_factor, overlap_threshold=overlap_threshold
                             )
                             
                             if ~np.all(np.isnan(np.array(extracted_peak))):         
@@ -637,6 +665,8 @@ class TimeFrequencyRepresentation:
                                 lower_bound = extracted_peak[0][3]
                                 upper_bound = extracted_peak[0][4]
                             else:
+                                # >>TODO: assign values to cf, and bw as well.
+                                fooof_periodic_params[band_label]['amplitude'][chn_idx, time_pt] = -1
                                 upper_bound = np.nan
                                 lower_bound = np.nan
                                 # print(f"No peak found in band {band_label} for channel {chn_idx} at time {time_pt}.")
@@ -650,8 +680,8 @@ class TimeFrequencyRepresentation:
                                     else:
                                         middle_value = (lower_bound + prev_upper_bound)/2
                                         lower_bound = middle_value
-                                        fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = middle_value + 0.5
-                                        fooof_periodic_params[prev_band_label]['upper_bound'][chn_idx, time_pt] = middle_value - 0.5
+                                        fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = middle_value + 1
+                                        fooof_periodic_params[prev_band_label]['upper_bound'][chn_idx, time_pt] = middle_value - 1
                                 else:
                                     fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt] = lower_bound
                             else:
@@ -661,36 +691,50 @@ class TimeFrequencyRepresentation:
                                 prev_upper_bound = upper_bound
                                 prev_band_label = band_label
 
-                    # Calculate absolute and relative (to the aperiodic component) power
-                    for band_label in fooof_periodic_params.keys():
+                        # Calculate absolute and relative (to the aperiodic component) power
+                        try:
+                            curr_aperiodic_fit = gen_aperiodic(
+                                curr_fooof_model.freqs, curr_fooof_model._robust_ap_fit(curr_fooof_model.freqs, curr_fooof_model.power_spectrum)
+                            )
+                        except:
+                            print('Error in calculating aperiodic fit')
+                            continue
 
-                        if band_label != 'delta':
-                            lower_bound = fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt]
-                            upper_bound = fooof_periodic_params[band_label]['upper_bound'][chn_idx, time_pt]
-                        else:
-                            lower_bound, upper_bound = fbands[band_label]
+                        curr_fooof_model.freqs -= start_freq_diff
+                        curr_fooof_model.peak_params_[:, 0] -= start_freq_diff # shift back the peak frequencies to the original range
 
-                        if lower_bound is not None and upper_bound is not None:
-                            band_mask = (tfr_freqs >= lower_bound) & (tfr_freqs <= upper_bound)
+                        fooof_model[(chn_idx, time_pt)] = curr_fooof_model
 
-                            if band_mask.any():
-                                power_absolute = np.mean(curr_fooof_model.power_spectrum[band_mask])
-                                power_relative = np.mean(curr_fooof_model.power_spectrum[band_mask] - curr_aperiodic_fit[band_mask])
+
+                        for band_label in fooof_periodic_params.keys():
+
+                            if band_label != 'delta':
+                                lower_bound = fooof_periodic_params[band_label]['lower_bound'][chn_idx, time_pt]
+                                upper_bound = fooof_periodic_params[band_label]['upper_bound'][chn_idx, time_pt]
                             else:
-                                power_absolute = np.nan
-                                power_relative = np.nan
-                            
-                            fooof_periodic_params[band_label]['avg_power_absolute'][chn_idx, time_pt] = power_absolute
-                            fooof_periodic_params[band_label]['avg_power_relative'][chn_idx, time_pt] = power_relative
+                                lower_bound, upper_bound = fbands[band_label]
 
-                    aperiodic_fit[(chn_idx, time_pt)] = curr_aperiodic_fit
+                            if lower_bound is not None and upper_bound is not None:
+                                band_mask = (curr_fooof_model.freqs >= lower_bound) & (curr_fooof_model.freqs <= upper_bound)
 
-                    freq_includ_idx = np.where(self.frequencies > aperiodic_fit_start_frequency)[0]
-                    slope, _ = np.polyfit(self.frequencies[freq_includ_idx], curr_aperiodic_fit[freq_includ_idx], 1)
-                    aperiodic_fit_slope[chn_idx, time_pt] = -10*slope # since aperiodc_fit is of the type log(power). So, to calculate in dB we need to multiply by 10
+                                if band_mask.any():
+                                    power_absolute = np.mean(curr_fooof_model.power_spectrum[band_mask])
+                                    power_relative = np.mean(curr_fooof_model.power_spectrum[band_mask] - curr_aperiodic_fit[band_mask])
+                                else:
+                                    power_absolute = -1
+                                    power_relative = -1
+                                
+                                fooof_periodic_params[band_label]['avg_power_absolute'][chn_idx, time_pt] = power_absolute
+                                fooof_periodic_params[band_label]['avg_power_relative'][chn_idx, time_pt] = power_relative
 
-                    # except:
-                    #     print('Faining to process FOOOF model for the current window/time point')
+                        aperiodic_fit[(chn_idx, time_pt)] = curr_aperiodic_fit
+
+                        freq_includ_idx = np.where(self.frequencies > aperiodic_fit_start_frequency)[0]
+                        slope, _ = np.polyfit(self.frequencies[freq_includ_idx], curr_aperiodic_fit[freq_includ_idx], 1)
+                        aperiodic_fit_slope[chn_idx, time_pt] = -10*slope # since aperiodc_fit is of the type log(power). So, to calculate in dB we need to multiply by 10
+
+                        # except:
+                        #     print('Faining to process FOOOF model for the current window/time point')
 
         return fooof_periodic_params, fooof_model, aperiodic_fit, aperiodic_fit_slope
 
@@ -756,7 +800,7 @@ class TimeFrequencyRepresentation:
         combine_bw = combine_bw_end - combine_bw_start
         return (highest_peak[0], highest_peak[1], combine_bw, combine_bw_start, combine_bw_end)
     
-    def _extract_highest_peak_in_band(self, fooof_model, freq_band, band_width_factor, overlap_threshold):
+    def _extract_highest_peak_in_band(self, peaks, freq_band, band_width_factor, overlap_threshold):
         """
         Extracts the highest peak within a specified frequency band from FOOOF results.
 
@@ -769,7 +813,6 @@ class TimeFrequencyRepresentation:
         """
         highest_peaks_with_overlaps = []
 
-        peaks = fooof_model.get_params('peak_params')
         if peaks.ndim > 1 and peaks.shape[0] > 0:
             for peak_idx in range(peaks.shape[0]):
                 # Calculate the standard deviation based on the bandwidth (FWHM)

@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
+from numpy.linalg import svd
 
 def create_mne_raw_from_data(data, channel_names, sampling_frequency, eeg_channel_count=16, ch_types=None):
     """
@@ -213,8 +214,8 @@ def detect_and_interpolate_outliers(time_series, iqr_factor=1.5):
 
     if len(time_series) >= 3:
         # Calculate the first quartile (Q1) and third quartile (Q3)
-        Q1 = np.percentile(time_series, 25)
-        Q3 = np.percentile(time_series, 75)
+        Q1 = np.nanpercentile(time_series, 25)
+        Q3 = np.nanpercentile(time_series, 75)
         
         # Calculate the Interquartile Range (IQR)
         IQR = Q3 - Q1
@@ -291,5 +292,120 @@ def detect_and_interpolate_outliers_v2(time_series, window_size=3, std_factor=3)
             clean_series[original_nans] = np.nan
         except:
             pass
-
     return np.array(clean_series)
+
+def normalize_time_and_resample(data, times, start_time=None, end_time=None, number_target_time_points=1000, ):
+    """
+    Normalize the time and resample the array based on the target time points.
+
+    Parameters:
+        data (ndarray): A 2D array where each row represents data at a specific frequency, 
+                        and columns represent time points.
+        times (ndarray): 1D array of original time points corresponding to the columns of `data`.
+        start_time (float): Start time for normalization.
+        end_time (float): End time for normalization.
+        number_target_time_points (int): numbe of target time points for resampling.
+
+    Returns:
+        resampled_data (ndarray): The resampled array at target time points, shape 
+                                  (data.shape[0], len(target_time_points)).
+    """
+    if data.ndim != 2:
+        data = data.reshape(1, -1) # Reshape to 2D array if it's 1D like a single frequency band
+
+    if start_time is None:
+        start_time = times[0]
+    if end_time is None:
+        end_time = times[-1]
+
+    # Normalize time to range [0, 1]
+    normalized_time = (times - start_time) / (end_time - start_time)
+    target_time_points = np.linspace(0, 1, number_target_time_points)
+    
+    # Replace NaN values in data with 0 (NOTE: Might need to change this)
+    data = np.nan_to_num(data, nan=0.0)
+    
+    # Resample data to target time points using linear interpolation
+
+    # NOTE: the resampled_data will be initiated as all zeros - Might need to change this
+    resampled_data = np.zeros((data.shape[0], len(target_time_points)))
+    
+    for i in range(data.shape[0]):  # Iterate over each frequency
+        interp_func = interp1d(
+            normalized_time, data[i, :], kind='linear', fill_value="extrapolate"
+        )
+        resampled_data[i, :] = interp_func(target_time_points)
+
+    return resampled_data
+
+def gini(array):
+    """Calculate the Gini coefficient of a numpy array."""
+    array = array.flatten()
+    if np.amin(array) < 0:
+        array -= np.amin(array)
+    array = array + 1e-16
+    array = np.sort(array)
+    index = np.arange(1, array.shape[0] + 1)
+    n = array.shape[0]
+    return ((np.sum((2 * index - n - 1) * array)) / (n * np.sum(array)))
+
+import numpy as np
+
+def get_ordered_states(transition_matrix):
+    """
+    Orders states based on the most likely sequence of transitions.
+    
+    Args:
+        transition_matrix (numpy.ndarray): Square matrix with transition probabilities.
+
+    Returns:
+        ordered_indices (list): List of state indices in the preferred order.
+    """
+    num_states = transition_matrix.shape[0]
+    visited = set()
+    ordered_indices = []
+
+    # Start from the state with the highest outgoing probability sum
+    start_state = np.argmax(transition_matrix.sum(axis=0))  
+    current_state = start_state
+
+    while len(ordered_indices) < num_states:
+        ordered_indices.append(current_state)
+        visited.add(current_state)
+
+        # Find the most probable next state (excluding already visited states)
+        next_states = np.argsort(transition_matrix[current_state])[::-1]  # Sort by probability (descending)
+        next_state = next((s for s in next_states if s not in visited), None)
+
+        if next_state is not None:
+            current_state = next_state
+        else:
+            # If no unvisited state remains with direct high probability, pick any remaining state
+            remaining_states = [s for s in range(num_states) if s not in visited]
+            if remaining_states:
+                current_state = remaining_states[0]  # Pick first remaining state
+
+    return ordered_indices
+
+
+def weighted_pca_scores(X: np.ndarray, w: np.ndarray, n_components=None):
+    """
+    Return (scores, components, explained_variance) for row‑weights w.
+    X shape = (n_samples, n_features)
+    """
+    w = np.asarray(w, float)
+    w /= w.sum()                       # normalise so Σw = 1
+
+    # weighted mean & centre
+    mu  = np.average(X, axis=0, weights=w)
+    Xc  = X - mu
+
+    # scale rows by sqrt(weight)  → ordinary SVD does the rest
+    Xw  = Xc * np.sqrt(w[:, None])
+
+    U, S, Vt = svd(Xw, full_matrices=False)
+    scores   = np.sqrt(len(w)) * U[:, :n_components] * S[:n_components]
+    comps    = Vt[:n_components]
+    expl_var = (S**2) / (len(w) - 1)     # weighted analogue
+
+    return scores, comps, expl_var[:n_components]

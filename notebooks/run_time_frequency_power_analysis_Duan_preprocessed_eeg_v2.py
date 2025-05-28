@@ -18,7 +18,22 @@ from src.eeg_analysis.visualization.my_custom_style import set_custom_style
 
 # %%
 dataset_dir = 'E:/Caffeine_data'
-participant_names = [f'CA-{id:02}' for id in range(1, 72)]
+participant_names = [f'CA-{id:02}' for id in range(49, 50)] 
+
+# fbands = {
+#     'delta': [0.5, 4],
+#     'theta': [4, 7],
+#     'alpha':[7, 16],
+#     'beta': [16, 35],
+#     'gamma':[35, 55]
+# }
+fbands={
+    'delta': [0, 4],
+    'theta': [4, 7],
+    'alpha':[7, 20],
+    'beta': [20, 35],
+    'gamma':[35, 55]
+}
 
 # %%
 def get_eeg_file(dataset_dir=None, participant_name=None):
@@ -346,7 +361,7 @@ for participant_name in participant_names:
 
 
         # %%
-        power_spectral.postprocess_frequency_domain_whitening(attr_name='region_average_tfr')
+        power_spectral.postprocess_frequency_domain_whitening(attr_name='region_average_tfr', fbands=fbands)
 
 
         # %%
@@ -436,7 +451,7 @@ for participant_name in participant_names:
         # %%
         import pickle
         base_results_filename = base_results_dir / f'CA-{participant_id:02}'
-        filename = f'{base_results_filename}_power_spectral'
+        filename = f'{base_results_filename}_power_spectral_wider_alpha_band'
         file_path = os.path.join(base_results_dir, filename)
 
         with open(f"{file_path}.pkl", "wb") as file:

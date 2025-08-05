@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
-from numpy.linalg import svd
+
+from typing import Tuple, Optional
 
 def create_mne_raw_from_data(data, channel_names, sampling_frequency, eeg_channel_count=16, ch_types=None):
     """
@@ -387,25 +388,290 @@ def get_ordered_states(transition_matrix):
 
     return ordered_indices
 
-
-def weighted_pca_scores(X: np.ndarray, w: np.ndarray, n_components=None):
+def wquantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
     """
-    Return (scores, components, explained_variance) for row‑weights w.
-    X shape = (n_samples, n_features)
+    Compute the **weighted q‑quantile** of an array.
+
+    The function ignores any element where either the value or its weight is
+    NaN, then sorts the remaining data by value and accumulates weights until
+    the desired quantile is reached.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Array of data points.
+    weights : np.ndarray
+        Corresponding non‑negative weights for each data point. Must be the same
+        shape as `values`.
+    q : float
+        Desired quantile in the closed interval ``[0, 1]`` (e.g., ``0.5`` for
+        the median).
+
+    Returns
+    -------
+    float
+        The weighted quantile. If `values` is empty after NaN removal or the
+        total weight is zero, returns ``np.nan``.
+
+    Notes
+    -----
+    The implementation is equivalent to the algorithm described in
+    *Hyndman & Fan (1996), “Sample Quantiles in Statistical Packages,”*
+    Method 2 for weighted data:
+
+    1. Drop any pair where either entry is NaN.
+    2. Sort the remaining values; carry the weights along.
+    3. Let ``W`` be the cumulative sum of sorted weights and
+       ``W_total`` the sum of all weights.
+    4. The q‑quantile is the first value whose cumulative weight
+       satisfies ``W ≥ q × W_total``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> wquantile(np.array([1, 2, 3]), np.array([1, 1, 1]), 0.5)
+    2.0
+    >>> wquantile(np.array([1, 2, 3]), np.array([0.1, 0.8, 0.1]), 0.5)
+    2.0
     """
-    w = np.asarray(w, float)
-    w /= w.sum()                       # normalise so Σw = 1
 
-    # weighted mean & centre
-    mu  = np.average(X, axis=0, weights=w)
-    Xc  = X - mu
+    v, w = map(np.asarray, (values, weights))
+    msk  = ~(np.isnan(v) | np.isnan(w))
+    v, w = v[msk], w[msk]
 
-    # scale rows by sqrt(weight)  → ordinary SVD does the rest
-    Xw  = Xc * np.sqrt(w[:, None])
+    if v.size == 0 or w.sum() == 0:
+        return np.nan
+    
+    order = np.argsort(v)
+    v_sorted, w_sorted = v[order], w[order]
+    cum_w = np.cumsum(w_sorted)
+    return v_sorted[cum_w >= q * w_sorted.sum()][0]
 
-    U, S, Vt = svd(Xw, full_matrices=False)
-    scores   = np.sqrt(len(w)) * U[:, :n_components] * S[:n_components]
-    comps    = Vt[:n_components]
-    expl_var = (S**2) / (len(w) - 1)     # weighted analogue
+def weighted_pca(
+    X: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    n_components: Optional[int] = None,
+    center: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Inverse-probability-weighted PCA.
 
-    return scores, comps, expl_var[:n_components]
+    Parameters
+    ----------
+    X : array, shape (n_features, n_samples)
+        Data matrix with samples (time windows) in columns.
+    weights : array, shape (n_samples,), optional
+        IPW weights for each column.  If None, ordinary PCA is performed.
+    n_components : int or None
+        How many PCs to return. None -> keep all.
+    center : bool
+        Subtract the weighted mean before PCA (recommended).
+
+    Returns
+    -------
+    scores : array, shape (n_components, n_samples)
+        Principal-component time series (each row is a PC).
+    components_ : array, shape (n_components, n_features)
+        Loading vectors (same orientation as scikit-learn: rows = PCs).
+    eigvals_ : array, shape (n_components,)
+        Eigenvalues of the weighted covariance matrix.
+    explained_variance_ratio_ : array, shape (n_components,)
+        Fraction of variance explained by each PC.
+    """
+    F, N = X.shape
+    if weights is None:
+        weights = np.ones(N)
+    weights = np.asarray(weights, dtype=float)
+    if weights.shape[0] != N:
+        raise ValueError("weights must have length equal to X.shape[1]")
+   
+    # --- normalise for numerical stability (mean 1) ----------
+    weights = weights / weights.mean()
+
+    # --- (1) weighted mean & centring ------------------------
+    if center:
+        mu = (X * weights).sum(axis=1, keepdims=True) / weights.sum()
+        Xc = X - mu
+    else:
+        Xc = X.copy()
+
+
+    # --- (2) weighted covariance via square-root trick -------
+    Wsqrt = np.sqrt(weights)          # shape (N,)
+    Xw = Xc * Wsqrt                   # broadcasts across rows
+
+
+    # --- (3) economy SVD (eig-decomp of covariance) ---------
+    #     Xw = U S Vᵀ, cov = (1/Σw) * U S² Uᵀ
+    U, S, _ = np.linalg.svd(Xw, full_matrices=False)
+    eigvals = (S**2) / weights.sum()       # shape (min(F,N),)
+
+
+    # --- (4) order & truncate -------------------------------
+    if n_components is None or n_components > U.shape[1]:
+        n_components = U.shape[1]
+    components_ = U[:, :n_components].T        # PCs x features
+    scores = (components_ @ Xc).T              # samples × PCs
+    eigvals_ = eigvals[:n_components]
+    explained_variance_ratio_ = eigvals_ / eigvals.sum()
+
+    # ------ enforce positive orientation --------------------
+    for k in range(n_components):
+        comp = components_[k]
+        pivot = np.argmax(np.abs(comp)) # index of largest amplitude 
+        if comp[pivot] < 0:
+            components_[k] *= -1
+            scores[:, k] *= -1
+
+    return scores, components_, eigvals_, explained_variance_ratio_
+
+
+def gen_significance_string(p_value, marker='*'):
+    if p_value < 0.001:
+        return marker * 3
+    elif p_value < 0.01:
+        return marker * 2
+    elif p_value < 0.05:
+        return marker
+    else:
+        return ' '
+
+def _weighted_box_stats(x, w=None, whis=1.5):
+    """Return dict usable by matplotlib.Axes.bxp().
+
+    Parameters
+    ----------
+    x : array-like (1D)
+    w : array-like or None (same length as x)
+    whis : float, Tukey multiplier (1.5 => default IQR rule)
+
+    Notes
+    -----
+    * Weighted quartiles via supplied wquantile() when w provided.
+    * Whiskers computed by Tukey fences from (weighted) Q1/Q3 but applied to raw x.
+    """
+    x = np.asarray(x, float)
+    mask = np.isfinite(x)
+    x = x[mask]
+    if w is not None:
+        w = np.asarray(w, float)[mask]
+        s = w.sum()
+        if s > 0:
+            w = w / s
+        med = wquantile(x, w, 0.5)
+        q1 = wquantile(x, w, 0.25)
+        q3 = wquantile(x, w, 0.75)
+    else:
+        q1, med, q3 = np.percentile(x, [25, 50, 75])
+
+    iqr = q3 - q1
+    lo_fence = q1 - whis * iqr
+    hi_fence = q3 + whis * iqr
+
+    in_fence = x[(x >= lo_fence) & (x <= hi_fence)]
+    if in_fence.size:
+        whisk_lo = np.min(in_fence)
+        whisk_hi = np.max(in_fence)
+    else:  # degenerate
+        whisk_lo = q1
+        whisk_hi = q3
+
+    fliers = x[(x < whisk_lo) | (x > whisk_hi)]
+    return {
+        'med': med,
+        'q1': q1,
+        'q3': q3,
+        'whislo': whisk_lo,
+        'whishi': whisk_hi,
+        'fliers': fliers,
+    }
+
+def _paired_perm_p(diffs, weights, n_perm=10000, rng=None):
+    """
+    Weighted paired test via sign-flip permutation on 'diffs' (post - pre).
+    Test statistic: weighted median of diffs.
+    Two-sided p.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    diffs = np.asarray(diffs, float)
+    weights = np.asarray(weights, float)
+    # normalize weights (safe if all zero? -> fall back to equal)
+    s = weights.sum()
+    if s <= 0:
+        weights = np.ones_like(weights) / len(weights)
+    else:
+        weights = weights / s
+    obs = wquantile(diffs, weights, 0.5)
+
+    flips = rng.choice([-1.0, 1.0], size=(n_perm, diffs.size))
+    perm_stats = np.apply_along_axis(
+        lambda v: wquantile(diffs * v, weights, 0.5),
+        axis=1,
+        arr=flips
+    )
+    p = (np.sum(np.abs(perm_stats) >= abs(obs)) + 1) / (n_perm + 1)
+    return obs, p
+
+
+def _two_sample_perm_p(x, w_x, y, w_y, n_perm=10000, rng=None):
+    """
+    Weighted two-sample test for difference in medians.
+    Pools data, permutes group labels (respecting total n), re-computes
+    weighted median difference each perm. Two-sided p.
+
+    Returns (obs_stat, p).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    w_x = np.asarray(w_x, float); w_y = np.asarray(w_y, float)
+
+    # drop NaNs
+    mx = np.isfinite(x); my = np.isfinite(y)
+    x = x[mx]; w_x = w_x[mx]
+    y = y[my]; w_y = w_y[my]
+
+    if x.size == 0 or y.size == 0:
+        return np.nan, np.nan
+
+    # normalize per group
+    sx = w_x.sum(); sy = w_y.sum()
+    if sx <= 0: w_x = np.ones_like(w_x) / len(w_x)
+    else:       w_x = w_x / sx
+    if sy <= 0: w_y = np.ones_like(w_y) / len(w_y)
+    else:       w_y = w_y / sy
+
+    med_x = wquantile(x, w_x, 0.5)
+    med_y = wquantile(y, w_y, 0.5)
+    obs = med_x - med_y
+
+    # pool
+    pooled_vals = np.concatenate([x, y])
+    pooled_w    = np.concatenate([w_x, w_y])
+    n_x = x.size
+    n_tot = pooled_vals.size
+
+    # precompute normalized weights for perm splits efficiently
+    idx = np.arange(n_tot)
+    perm_stats = np.empty(n_perm, float)
+    for i in range(n_perm):
+        rng.shuffle(idx)            # in-place
+        sel = idx[:n_x]
+        mask = np.zeros(n_tot, bool)
+        mask[sel] = True
+
+        xv = pooled_vals[mask]; xw = pooled_w[mask]
+        yv = pooled_vals[~mask]; yw = pooled_w[~mask]
+
+        sx = xw.sum(); sy = yw.sum()
+        if sx <= 0: xw = np.ones_like(xw) / len(xw)
+        else:       xw = xw / sx
+        if sy <= 0: yw = np.ones_like(yw) / len(yw)
+        else:       yw = yw / sy
+
+        perm_stats[i] = wquantile(xv, xw, 0.5) - wquantile(yv, yw, 0.5)
+
+    p = (np.sum(np.abs(perm_stats) >= abs(obs)) + 1) / (n_perm + 1)
+    return obs, p

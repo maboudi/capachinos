@@ -668,7 +668,7 @@ def get_fixed_positions(num_states, layout='circular'):
     else:
         raise ValueError("Unsupported layout type. Choose either 'circular' or 'linear'.")
     
-def plot_transition_graph(transition_matrix, node_weight, threshold=0.2, node_labels=None, node_scale=500, edge_scale=10, print_edge_label=False, layout='circular', ax=None):
+def plot_transition_graph(transition_matrix, node_weight, threshold=0.2, node_labels=None, node_scale=500, node_fontsize=6, edge_scale=10, print_edge_label=False, layout='circular', ax=None):
     """
     Plots a directed transition graph based on a given transition probability matrix.
 
@@ -714,7 +714,7 @@ def plot_transition_graph(transition_matrix, node_weight, threshold=0.2, node_la
         fig, ax = plt.subplots(figsize=(6, 6))
 
     nx.draw(G, fixed_positions, with_labels=True, node_color="lightblue", edge_color="gray",
-            node_size=node_sizes, font_size=12, arrows=True, arrowstyle='->', 
+            node_size=node_sizes, font_size=node_fontsize, arrows=True, arrowstyle='->', 
             width=edge_widths, connectionstyle="arc3,rad=0.2", labels=node_labels, ax=ax)
 
     # Draw edge labels

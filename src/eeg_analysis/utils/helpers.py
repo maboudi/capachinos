@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
-
+import statsmodels.formula.api as smf
+from scipy.stats import chi2
 from typing import Tuple, Optional
 
 def create_mne_raw_from_data(data, channel_names, sampling_frequency, eeg_channel_count=16, ch_types=None):
@@ -675,3 +676,62 @@ def _two_sample_perm_p(x, w_x, y, w_y, n_perm=10000, rng=None):
 
     p = (np.sum(np.abs(perm_stats) >= abs(obs)) + 1) / (n_perm + 1)
     return obs, p
+
+def _lmm_omnibus_any_segment(
+    A_mat, B_mat,                # shape: n_subj × NUM_DIVISIONS (already in dB)
+    ipw_A=None, ipw_B=None,      # 1D arrays (len = n_subj in each group) or None
+    subtract_pre=False,
+    pre_A=None, pre_B=None       # 1D arrays (len = n_subj), required if subtract_pre=True
+):
+    """
+    Returns:
+        p_int  : omnibus p-value for Group×Segment interaction (primary)
+        p_main : p-value for Group main effect (optional overall difference)
+    """
+    import numpy as np, pandas as pd
+
+    nSeg = A_mat.shape[1]
+
+    if subtract_pre:
+        if pre_A is None or pre_B is None:
+            raise ValueError("pre_A/pre_B required when subtract_pre=True")
+        A_use = A_mat - pre_A[:, None]
+        B_use = B_mat - pre_B[:, None]
+    else:
+        A_use, B_use = A_mat, B_mat
+
+    nA, nB = A_use.shape[0], B_use.shape[0]
+
+    y      = np.r_[A_use.ravel(), B_use.ravel()]
+    subj   = np.r_[np.repeat(np.arange(nA), nSeg),
+                   np.repeat(np.arange(nB) + nA, nSeg)]
+    group  = np.r_[np.repeat('A', nA*nSeg), np.repeat('B', nB*nSeg)]
+    segment = np.tile(np.arange(nSeg), nA + nB)
+
+    # stabilized weights (default to 1s)
+    wA = np.ones(nA) if ipw_A is None else (np.asarray(ipw_A) / np.nanmean(ipw_A))
+    wB = np.ones(nB) if ipw_B is None else (np.asarray(ipw_B) / np.nanmean(ipw_B))
+    w  = np.r_[np.repeat(wA, nSeg), np.repeat(wB, nSeg)]
+
+    df_long = pd.DataFrame({
+        "y": y, "subj": subj, "group": group, "segment": segment, "w": w
+    })
+    df_long["segment"] = df_long["segment"].astype("category")
+
+    # random intercept per subject; use ML for LR tests
+    full   = smf.mixedlm("y ~ group * C(segment)", df_long, groups=df_long["subj"],
+                         weights=df_long["w"]).fit(reml=False)
+    no_int = smf.mixedlm("y ~ group + C(segment)", df_long, groups=df_long["subj"],
+                         weights=df_long["w"]).fit(reml=False)
+
+    LR_int  = 2*(full.llf - no_int.llf)
+    df_diff = full.params.size - no_int.params.size
+    p_int   = chi2.sf(LR_int, df_diff)
+
+    # optional: overall (segment-averaged) group difference
+    no_grp  = smf.mixedlm("y ~ C(segment)", df_long, groups=df_long["subj"],
+                          weights=df_long["w"]).fit(reml=False)
+    LR_grp  = 2*(full.llf - no_grp.llf)
+    p_main  = chi2.sf(LR_grp, full.params.size - no_grp.params.size)
+
+    return p_int, p_main

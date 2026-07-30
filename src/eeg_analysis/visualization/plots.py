@@ -401,11 +401,11 @@ def plot_wPLI_frequency_profile_separate_groups(pli, vmin=None, vmax=None, ax=No
         ax_sub = fig.add_subplot(sub_gs[r1-1, r2])
         
         if median_A is not None:
-            ax_sub.plot(pli.freqs, median_A[r1, r2, :], color=BLUE, linewidth=1, label='Group A') 
+            ax_sub.plot(pli.freqs, median_A[r1, r2, :], color=BLUE, linewidth=1, label='Placebo') 
             ax_sub.fill_between(pli.freqs, lower_iqr_A[r1, r2, :], upper_iqr_A[r1, r2, :], color=BLUE, alpha=0.25, linewidth=0)
             
         if median_B is not None:
-            ax_sub.plot(pli.freqs, median_B[r1, r2, :], color=RED, linewidth=1, label='Group B') 
+            ax_sub.plot(pli.freqs, median_B[r1, r2, :], color=RED, linewidth=1, label='Caffeine') 
             ax_sub.fill_between(pli.freqs, lower_iqr_B[r1, r2, :], upper_iqr_B[r1, r2, :], color=RED, alpha=0.25, linewidth=0)
             
         ax_sub.set_title(f'{region_acrs[region_names[r1]]} - {region_acrs[region_names[r2]]}',

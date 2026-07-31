@@ -2,8 +2,8 @@ import numpy as np
 import scipy.signal as signal
 import mne
 from mne.preprocessing import ICA
-from src.eeg_analysis.utils.helpers import create_mne_raw_from_data
-from src.eeg_analysis.utils.helpers import calculate_z_score_eeg
+from capachinos.utils.helpers import create_mne_raw_from_data
+from capachinos.utils.helpers import calculate_z_score_eeg
 
 class EEGPreprocessor:
     def __init__(self, eeg_file):

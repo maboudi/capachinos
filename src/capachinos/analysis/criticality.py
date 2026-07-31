@@ -10,8 +10,8 @@ from powerlaw import trim_to_range
 import statsmodels.api as sm
 from warnings import warn
 from collections import Counter
-from src.eeg_analysis.preprocessing.eeg_preprocessor import EEGPreprocessor
-from src.eeg_analysis.utils.helpers import get_eeg_channel_indices, remove_outliers, calculate_z_score_eeg
+from capachinos.preprocessing.eeg_preprocessor import EEGPreprocessor
+from capachinos.utils.helpers import get_eeg_channel_indices, remove_outliers, calculate_z_score_eeg
 from collections import defaultdict
 from scipy.signal import correlate, correlation_lags
 import itertools

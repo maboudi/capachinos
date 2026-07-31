@@ -1,10 +1,10 @@
-from src.eeg_analysis.analysis.power_spectral import TimeFrequencyRepresentation
+from capachinos.analysis.power_spectral import TimeFrequencyRepresentation
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.ndimage import gaussian_filter
-from src.eeg_analysis.visualization.my_custom_style import set_custom_style
-from src.eeg_analysis.utils.helpers import gini
+from capachinos.visualization.my_custom_style import set_custom_style
+from capachinos.utils.helpers import gini
 import networkx as nx
 
 BLUE = "#1f3b73"  # Dark Blue

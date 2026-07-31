@@ -1,4 +1,4 @@
-from src.eeg_analysis.utils.helpers import create_mne_raw_from_data 
+from capachinos.utils.helpers import create_mne_raw_from_data 
 import mne
 import numpy as np
 

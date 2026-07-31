@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import mne
 from scipy.signal import filtfilt, spectrogram
-from src.eeg_analysis.utils.helpers import create_mne_raw_from_data, select_channels_and_adjust_data
+from capachinos.utils.helpers import create_mne_raw_from_data, select_channels_and_adjust_data
 import warnings
 from statsmodels.tsa.ar_model import AutoReg
 from fooof import FOOOF, FOOOFGroup

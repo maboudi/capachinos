@@ -1,6 +1,6 @@
 import numpy as np
-from src.eeg_analysis.preprocessing.eeg_preprocessor import EEGPreprocessor
-from src.eeg_analysis.utils.helpers import select_channels_and_adjust_data
+from capachinos.preprocessing.eeg_preprocessor import EEGPreprocessor
+from capachinos.utils.helpers import select_channels_and_adjust_data
 from mne_connectivity import spectral_connectivity_epochs
 import warnings
 

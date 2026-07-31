@@ -1,9 +1,8 @@
 # Import necessary classes from their respective modules
-from preprocessing import EEGFile
-from preprocessing import EEGPreprocessor
-from analysis import PowerSpectralAnalysis
-from analysis import ConnectivityAnalysis
-from analysis import CriticalityAnalysis
+from .preprocessing.eeg_file import EEGFile
+from .preprocessing.eeg_preprocessor import EEGPreprocessor
+from .analysis.power_spectral import PowerSpectralAnalysis
+from .analysis.connectivity import ConnectivityAnalysis
 
 class ParticipantData:
     def __init__(self, participant_id):
@@ -32,8 +31,9 @@ class ParticipantData:
         self.connectivity_analysis = ConnectivityAnalysis(self.preprocessed_eeg).analyze()
         
     def analyze_criticality(self):
-        # Assuming an appropriate method exists in the CriticalityAnalysis class
-        self.criticality_analysis = CriticalityAnalysis(self.preprocessed_eeg).analyze()
+        raise NotImplementedError(
+            "A unified CriticalityAnalysis class has not yet been implemented."
+        )
 
 """
 # Usage Example
